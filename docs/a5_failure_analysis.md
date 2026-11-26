@@ -1,12 +1,12 @@
 # KAVACH-FHIR — A5 Failure Analysis & Selective Quasi-Identifier Generalization Study
 
-> **Scope & Disclaimer:** All measurements in this document are **local diagnostic estimates** run offline against the practice dataset (`Secret-Wards-ToolKit-LF/dev/input`, `dev/attacker/registry.csv`, and `dev/attacker/known_facts.jsonl`) using `output/kavach-spec-final` and isolated experimental copies. They are **not** official hidden-evaluation scores. No production code (`main.py`, `detectors/`, `engine/`) or verified submission outputs were modified.
+> **Historical Snapshot Notice:** This document records an earlier diagnostic study against `output/kavach-spec-final` and isolated experimental copies. Do **not** read these numbers as current release metrics (current release practice results are `78 passed, 1 xfailed`, `0 / 3,230` PII, `4,855 / 4,855` clinical preservation, `1.00` precision, `0.85` recall, `0.97` F0.5, `CONTRACT OK`, `READY TO SUBMIT`). All measurements below are **local diagnostic estimates**, not official hidden-evaluation scores.
 
 ---
 
 ## 1. Audit of `bench_attacks.py` vs. `ATTACKS.md`
 
-Inspecting `bench_attacks.py` against [ATTACKS.md](file:///C:/Users/hp/devforge/Secret-Wards-ToolKit-LF/docs/ATTACKS.md) identified **four concrete methodology discrepancies**:
+Inspecting `bench_attacks.py` against `../Secret-Wards-ToolKit-LF/docs/ATTACKS.md` identified **four concrete methodology discrepancies**:
 
 1. **Missing Demographic Consistency Check (Primary cause of decoy false positives):**
    - `ATTACKS.md` (§A5) specifies: *"The profile's evidence must also be consistent with that person."*

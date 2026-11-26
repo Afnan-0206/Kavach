@@ -4,12 +4,12 @@ from __future__ import annotations
 import re
 
 from engine.clinical_shield import overlaps_protected
-from engine.normalization import _HOMOGLYPHS, _INDIC_DIGITS, normalize_text
+from engine.normalization import map_norm_span, normalize_text, normalize_with_map
 from engine.record_model import EntitySpan
 
 # Labeled names in English, Hinglish, and Hindi
 _LABELED_NAME_RE = re.compile(
-    r"(?i:(?:Patient(?:'s)?[ \t]+Name|Pt\.?[ \t]+Name|Full[ \t]+Name|Name|Naam|नाम|मरीज़(?:[ \t]+का[ \t]+नाम)?|रोगी(?:[ \t]+का[ \t]+नाम)?|"
+    r"(?i:(?:Patient(?:'s)?(?:[ \t]+Name)?|Pt\.?[ \t]+Name|Full[ \t]+Name|Name|Naam|नाम|मरीज़(?:[ \t]+का[ \t]+नाम)?|रोगी(?:[ \t]+का[ \t]+नाम)?|"
     r"Witnessed[ \t]+by|Raised[ \t]+by|Attendant(?:[ \t]+Name)?)[ \t]*[:\-][ \t]*"
     r"(?:Shri[ \t]+|Smt\.?[ \t]+|Mr\.?[ \t]+|Mrs\.?[ \t]+|Ms\.?[ \t]+|श्री[ \t]+|श्रीमती[ \t]+)?)"
     r"([A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+(?:[ \t]+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+){0,3})"
@@ -59,8 +59,9 @@ _STOP_WORDS = {
 def detect_contextual_names(text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
     """Detect person names using labels, honorifics, roles, and Hindi/Hinglish syntactic cues."""
     spans: list[EntitySpan] = []
-    # 1-to-1 homoglyph & Indic-digit fold preserves exact character offsets in `text`
-    scan_text = text if text.isascii() else text.translate(_HOMOGLYPHS).translate(_INDIC_DIGITS)
+    scan_text, idx_map = normalize_with_map(text)
+    if not scan_text:
+        return spans
 
     for rx in (
         _LABELED_NAME_RE,
@@ -74,10 +75,8 @@ def detect_contextual_names(text: str, protected: list[tuple[int, int, str]]) ->
         _NAME_BEFORE_PHONE_RE,
     ):
         for m in rx.finditer(scan_text):
-            start, end = m.start(1), m.end(1)
-            if overlaps_protected(start, end, protected):
-                continue
-            name = m.group(1).strip(" .,;:-")
+            raw_g = m.group(1)
+            name = raw_g.strip(" .,;:-")
             if not name or name.lower() in _STOP_WORDS:
                 continue
             parts = name.split()
@@ -86,9 +85,17 @@ def detect_contextual_names(text: str, protected: list[tuple[int, int, str]]) ->
             if not parts:
                 continue
             clean = " ".join(parts)
+            if clean.upper().startswith("PSN"):
+                continue
+            lead = len(raw_g) - len(raw_g.lstrip(" .,;:-"))
+            ns = m.start(1) + lead
+            ne = ns + len(clean)
+            start, end = map_norm_span(idx_map, ns, ne)
+            if end <= start or overlaps_protected(start, end, protected):
+                continue
             spans.append(EntitySpan(
                 start=start,
-                end=start + len(clean),
+                end=end,
                 entity_type="PATIENT_NAME",
                 text=clean,
                 role="patient",
@@ -132,18 +139,29 @@ class DynamicGazetteer:
                 re.IGNORECASE,
             )
 
-    def match(self, text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
+    def _match_rx(self, text: str, rx: re.Pattern | None, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
+        if rx is None or not text:
+            return []
+        scan_text, idx_map = normalize_with_map(text)
+        if not scan_text:
+            return []
         spans: list[EntitySpan] = []
-        for rx in (self._compiled_full, self._compiled_tok):
-            if rx is None:
-                continue
-            for m in rx.finditer(text):
-                if not overlaps_protected(m.start(), m.end(), protected):
-                    spans.append(EntitySpan(
-                        start=m.start(),
-                        end=m.end(),
-                        entity_type="PATIENT_NAME",
-                        text=m.group(0),
-                        role="patient",
-                    ))
+        for m in rx.finditer(scan_text):
+            start, end = map_norm_span(idx_map, m.start(), m.end())
+            if end > start and not overlaps_protected(start, end, protected):
+                spans.append(EntitySpan(
+                    start=start,
+                    end=end,
+                    entity_type="PATIENT_NAME",
+                    text=m.group(0),
+                    role="patient",
+                ))
         return spans
+
+    def match(self, text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
+        spans = self._match_rx(text, self._compiled_full, protected)
+        spans.extend(self._match_rx(text, self._compiled_tok, protected))
+        return spans
+
+    def match_full_only(self, text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
+        return self._match_rx(text, self._compiled_full, protected)

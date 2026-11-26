@@ -1,12 +1,12 @@
-# KAVACH-FHIR — Dashboard Redesign Documentation
+# KAVACH-FHIR — Dashboard Redesign Documentation (Historical Snapshot)
 
-> **Honesty & Verification Note:** Automated unit/security tests (`57 passed`) and live HTTP/API verification against the running `127.0.0.1:8771` server succeeded. Automated visual rendering in Chrome via the browser subagent could **not** execute because Chrome DevTools remote debugging (`DevToolsActivePort`) is not enabled on this host.
+> **Historical Snapshot Notice:** Records the initial dashboard redesign verification (`57 passed`). Subsequent security hardening (`Host`, `Origin`/`Referer`, `X-Kavach-CSRF`, `data-*` event delegation) is documented in [security_remediation_report.md](security_remediation_report.md), and current release practice metrics (`78 passed, 1 xfailed`) are in [README.md](../README.md).
 
 ---
 
 ## 1. Design System & Colour Tokens
 
-Implemented in [dashboard.py](file:///C:/Users/hp/devforge/Kavach-FHIR/dashboard.py) using local CSS custom properties and system/geometric sans-serif typography (`Inter, "Helvetica Neue", Arial, sans-serif`) with zero external fonts, CDNs, or network requests:
+Implemented in [dashboard.py](../dashboard.py) using local CSS custom properties and system/geometric sans-serif typography (`Inter, "Helvetica Neue", Arial, sans-serif`) with zero external fonts, CDNs, or network requests:
 
 - `--page-bg: #ECECEC` (neutral outer canvas)
 - `--frame: #5A5A58` & `--frame-dark: #252623` (large rounded charcoal outer application shell, `50px` / `42px` radius)
@@ -39,7 +39,7 @@ Implemented in [dashboard.py](file:///C:/Users/hp/devforge/Kavach-FHIR/dashboard
 
 ## 3. Preserved Backend & API Endpoints
 
-All existing backend behavior in [dashboard.py](file:///C:/Users/hp/devforge/Kavach-FHIR/dashboard.py) is preserved unchanged:
+All existing backend behavior in [dashboard.py](../dashboard.py) is preserved unchanged:
 - `GET /` — self-contained HTML/CSS/JS with strict CSP (`default-src 'self' 'unsafe-inline'; connect-src 'self'`)
 - `GET /api/status` — pipeline, evaluation, `report.json`, and `secret_configured` status
 - `POST /api/run` — subprocess `main.py` inheriting `RAKSHA_SECRET` (fail-closed if missing)
@@ -59,7 +59,7 @@ All existing backend behavior in [dashboard.py](file:///C:/Users/hp/devforge/Kav
 
 ## 5. Tests Executed & Results
 
-- `python -m pytest -v`: **57 passed in 6.85s** (including all 6 dashboard security/functional tests in [tests/test_dashboard.py](file:///C:/Users/hp/devforge/Kavach-FHIR/tests/test_dashboard.py)).
+- `python -m pytest -v`: **57 passed in 6.85s** (including all 6 dashboard security/functional tests in [tests/test_dashboard.py](../tests/test_dashboard.py)).
 - Live HTTP/API verification on `http://127.0.0.1:8771/`: `GET /` (`200`), `POST /api/evaluate` (`completed`, `CONTRACT OK`, `0 / 3230` PII, `4855 / 4855` medical), `GET /api/files` (`193` files), `GET /api/preview` (`csv`, `json`, `txt` all labeled `SANITIZED OUTPUT`), and `403` on `../report.json`.
 
 ---

@@ -5,12 +5,46 @@ import csv
 import hashlib
 import io
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
 from engine.record_model import IngestedFile
 
 SUPPORTED_EXTS = {".csv", ".tsv", ".json", ".txt"}
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    """Return True if path is a symlink or Windows reparse point (junction/mount)."""
+    if path.is_symlink():
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    if attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        return True
+    return False
+
+
+def _has_unsafe_path_component(path: Path, input_root: Path) -> bool:
+    """Reject symlinks/reparse points anywhere in path or resolved escapes outside input_root."""
+    cur = path
+    while True:
+        if _is_reparse_or_symlink(cur):
+            return True
+        if cur == input_root or cur.parent == cur:
+            break
+        cur = cur.parent
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return True
+    return not resolved.is_relative_to(input_root)
 
 
 def decode_bytes(raw: bytes) -> tuple[str | None, str]:
@@ -74,8 +108,34 @@ def ingest_directory(
     results: list[IngestedFile] = []
     max_bytes = max_file_size_mb * 1024 * 1024
 
-    all_paths = sorted(p for p in input_dir.rglob("*") if p.is_file())
-    for path in all_paths:
+    all_paths: list[Path] = []
+    unsafe_paths: list[Path] = []
+    input_root = input_dir.resolve()
+    for root, dirs, files in os.walk(input_dir, followlinks=False):
+        root_p = Path(root)
+        safe_dirs: list[str] = []
+        for d in sorted(dirs):
+            dp = root_p / d
+            if _is_reparse_or_symlink(dp) or not dp.resolve().is_relative_to(input_root):
+                unsafe_paths.append(dp)
+            else:
+                safe_dirs.append(d)
+        dirs[:] = safe_dirs
+        for fn in sorted(files):
+            fp = root_p / fn
+            if _has_unsafe_path_component(fp, input_root):
+                unsafe_paths.append(fp)
+            else:
+                all_paths.append(fp)
+
+    for up in sorted(unsafe_paths):
+        rel = up.relative_to(input_dir).as_posix()
+        results.append(IngestedFile(
+            rel_path=rel, out_rel=rel, sha256="0" * 64, ext=up.suffix.lower(), fmt="quarantined",
+            status="quarantined", quarantine_reason="symlink_or_path_escape",
+        ))
+
+    for path in sorted(all_paths):
         rel = path.relative_to(input_dir).as_posix()
         raw = path.read_bytes()
         sha = hashlib.sha256(raw).hexdigest()

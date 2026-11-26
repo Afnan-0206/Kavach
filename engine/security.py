@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import warnings
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -17,6 +18,12 @@ class KeyRing:
     def __init__(self, secret: bytes) -> None:
         if not secret or not secret.strip():
             raise ValueError("RAKSHA_SECRET must be set to a non-empty, non-whitespace value")
+        if len(secret.strip()) < 16:
+            warnings.warn(
+                "RAKSHA_SECRET is shorter than 16 bytes; use at least 128 bits of entropy for production.",
+                UserWarning,
+                stacklevel=2,
+            )
         self._pseudonym_key = self._derive(secret, b"kavach-fhir:pseudonym:v1", 32)
         self._date_shift_key = self._derive(secret, b"kavach-fhir:date-shift:v1", 32)
         self._filename_key = self._derive(secret, b"kavach-fhir:filename:v1", 32)

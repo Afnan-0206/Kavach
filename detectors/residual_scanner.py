@@ -15,7 +15,7 @@ def scan_and_scrub_residual(
     text: str,
     gazetteer: DynamicGazetteer | None = None,
 ) -> tuple[str, int]:
-    """Scan output text for any surviving direct IDs or known patient names and scrub them."""
+    """Scan output text for any surviving direct IDs, MRNs, phones, or known patient names and scrub them."""
     if not text:
         return text, 0
     has_id_char = any(c.isdigit() or c == "@" for c in text)
@@ -28,18 +28,13 @@ def scan_and_scrub_residual(
 
     if has_id_char:
         for s in detect_indian_ids(text):
-            if s.entity_type in ("AADHAAR", "ABHA_NUMBER", "ABHA_ADDRESS", "PAN", "EMAIL", "INSURANCE_ID", "AADHAAR_MASKED"):
-                if not overlaps_protected(s.start, s.end, protected):
-                    hits.append(s)
-
-        for s in detect_phones(text):
-            if not overlaps_protected(s.start, s.end, protected):
+            if s.entity_type in ("AADHAAR", "ABHA_NUMBER", "ABHA_ADDRESS", "PAN", "EMAIL", "INSURANCE_ID", "AADHAAR_MASKED", "MRN"):
                 hits.append(s)
 
+        hits.extend(detect_phones(text))
+
     if has_gaz:
-        for m in gazetteer._compiled_full.finditer(text):
-            if not overlaps_protected(m.start(), m.end(), protected):
-                hits.append(EntitySpan(m.start(), m.end(), "PATIENT_NAME", m.group(0)))
+        hits.extend(gazetteer.match_full_only(text, protected))
 
     resolved = resolve_overlaps(hits)
     if not resolved:

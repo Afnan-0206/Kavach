@@ -100,7 +100,7 @@ def classify_field_name(field_name: str) -> str | None:
         return "TEHSIL"
     if any(w in k for w in ("pin", "zip", "postal")):
         return "PIN"
-    if any(w in k for w in ("address", "pata", "street", "house", "mohalla", "locality", "landmark")) or k == "ward":
+    if any(w in k for w in ("address", "pata", "street", "house", "mohalla", "locality", "landmark")):
         return "ADDRESS"
     if any(w in k for w in ("source path", "source_path", "filepath", "file_path")):
         return "METADATA_PATH"
@@ -112,21 +112,17 @@ def classify_field_name(field_name: str) -> str | None:
 def detect_all_spans(
     text: str,
     gazetteer: DynamicGazetteer | None = None,
+    use_clinical_shield: bool = True,
 ) -> list[EntitySpan]:
-    """Run all layered detectors on text, respecting ClinicalShield."""
+    """Run all layered detectors on text, respecting ClinicalShield for ambiguous names."""
     if not text:
         return []
-    protected = find_protected_spans(text)
+    protected = find_protected_spans(text) if use_clinical_shield else []
     raw_spans: list[EntitySpan] = []
 
-    for s in detect_indian_ids(text):
-        if not overlaps_protected(s.start, s.end, protected):
-            raw_spans.append(s)
-
-    for s in detect_phones(text):
-        if not overlaps_protected(s.start, s.end, protected):
-            raw_spans.append(s)
-
+    # High-confidence structured identifiers always take precedence over clinical protection
+    raw_spans.extend(detect_indian_ids(text))
+    raw_spans.extend(detect_phones(text))
     raw_spans.extend(detect_kinship(text, protected))
 
     for s in detect_addresses(text):
@@ -146,6 +142,7 @@ def redact_text(
     gazetteer: DynamicGazetteer | None = None,
     stats: PipelineStats | None = None,
     pseudonym: str | None = None,
+    use_clinical_shield: bool = True,
 ) -> str:
     """Detect and replace PII spans in text, plus sanitize embedded base64 payloads."""
     if not text:
@@ -161,12 +158,15 @@ def redact_text(
         # Only treat as text attachment if mostly printable
         if not decoded or sum(ch.isprintable() or ch in "\r\n\t" for ch in decoded) / len(decoded) < 0.85:
             return tok
-        cleaned_inner = redact_text(decoded, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym)
+        cleaned_inner = redact_text(
+            decoded, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym,
+            use_clinical_shield=use_clinical_shield,
+        )
         return base64.b64encode(cleaned_inner.encode("utf-8")).decode("ascii")
 
     text = _B64_RE.sub(_clean_b64, text)
 
-    spans = detect_all_spans(text, gazetteer=gazetteer)
+    spans = detect_all_spans(text, gazetteer=gazetteer, use_clinical_shield=use_clinical_shield)
     if not spans:
         return text
 

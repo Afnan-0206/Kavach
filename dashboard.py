@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hmac
 import html
 import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -185,6 +187,7 @@ class DashboardState:
         self.sanitized_dir = self.output_dir / "sanitized"
         self.toolkit_dir = toolkit_dir.resolve() if toolkit_dir else None
         self.main_py = main_py.resolve()
+        self.csrf_token = secrets.token_urlsafe(32)
         self._lock = threading.Lock()
         self.pipeline_status = "idle"
         self.pipeline_exit_code: int | None = None
@@ -343,6 +346,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="kavach-csrf" content="__KAVACH_CSRF__" />
 <title>KAVACH-FHIR Local Dashboard</title>
 <style>
   :root {
@@ -1467,10 +1471,11 @@ async function refreshFiles() {
   allFiles = data.files || [];
   document.getElementById('file-count').textContent = `${allFiles.length} files`;
   const folders = Array.from(new Set(allFiles.map(f => f.includes('/') ? f.split('/')[0] : '.'))).sort();
-  document.getElementById('folder-filters').innerHTML =
-    `<button class="filter-chip ${folderFilter === 'all' ? 'active' : ''}" onclick="setFolderFilter('all', this)">All folders</button>` +
+  const folderEl = document.getElementById('folder-filters');
+  folderEl.innerHTML =
+    `<button class="filter-chip ${folderFilter === 'all' ? 'active' : ''}" data-folder="all">All folders</button>` +
     folders.slice(0, 6).map(fd =>
-      `<button class="filter-chip ${folderFilter === fd ? 'active' : ''}" onclick="setFolderFilter('${esc(fd)}', this)">${esc(fd)}</button>`
+      `<button class="filter-chip ${folderFilter === fd ? 'active' : ''}" data-folder="${esc(fd)}">${esc(fd)}</button>`
     ).join('');
   renderFileList();
 }
@@ -1485,9 +1490,19 @@ function renderFileList() {
     return okFmt && okFolder && okQ;
   });
   document.getElementById('file-list').innerHTML = shown.map(f =>
-    `<button class="file-btn ${f === activeFile ? 'active' : ''}" onclick="loadPreview('${esc(f)}')">${esc(f)}</button>`
+    `<button class="file-btn ${f === activeFile ? 'active' : ''}" data-path="${esc(f)}">${esc(f)}</button>`
   ).join('') || '<div class="vital-sub">No matching sanitized files.</div>';
 }
+
+document.getElementById('folder-filters').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-folder]');
+  if (btn) setFolderFilter(btn.getAttribute('data-folder'), btn);
+});
+
+document.getElementById('file-list').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-path]');
+  if (btn) loadPreview(btn.getAttribute('data-path'));
+});
 
 async function loadPreview(relPath) {
   activeFile = relPath;
@@ -1529,9 +1544,17 @@ async function copyPreview() {
   showBanner('Copied sanitized preview content to clipboard.', 'info');
 }
 
+function getCsrfToken() {
+  const el = document.querySelector('meta[name="kavach-csrf"]');
+  return el ? el.getAttribute('content') || '' : '';
+}
+
 async function triggerRun() {
   hideBanner();
-  const res = await fetch('/api/run', { method: 'POST' });
+  const res = await fetch('/api/run', {
+    method: 'POST',
+    headers: { 'X-Kavach-CSRF': getCsrfToken() },
+  });
   const d = await res.json();
   if (!res.ok) showBanner(d.error || 'Failed to start pipeline.', 'bad');
   else showBanner('Processing privacy pipeline locally...', 'info');
@@ -1542,7 +1565,10 @@ async function triggerRun() {
 
 async function triggerEval() {
   hideBanner();
-  const res = await fetch('/api/evaluate', { method: 'POST' });
+  const res = await fetch('/api/evaluate', {
+    method: 'POST',
+    headers: { 'X-Kavach-CSRF': getCsrfToken() },
+  });
   const d = await res.json();
   if (!res.ok) showBanner(d.error || 'Failed to start evaluation.', 'bad');
   else showBanner('Running official practice evaluator and contract validator...', 'info');
@@ -1575,12 +1601,33 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _is_valid_host(self) -> bool:
+            host_hdr = self.headers.get("Host", "").strip()
+            if not host_hdr:
+                return True
+            parsed_host = urlparse(f"http://{host_hdr}")
+            return parsed_host.hostname in ("127.0.0.1", "localhost")
+
+        def _is_valid_origin(self) -> bool:
+            port = self.server.server_port
+            for hdr in ("Origin", "Referer"):
+                val = self.headers.get(hdr)
+                if not val:
+                    continue
+                p = urlparse(val)
+                if p.scheme != "http" or p.hostname not in ("127.0.0.1", "localhost"):
+                    return False
+                if p.port is not None and p.port != port:
+                    return False
+            return True
+
         def _send_html(self, html_text: str) -> None:
-            body = html_text.encode("utf-8")
+            body = html_text.replace("__KAVACH_CSRF__", state.csrf_token).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:;",
@@ -1589,6 +1636,9 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def do_GET(self) -> None:
+            if not self._is_valid_host():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "Invalid Host header."})
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 self._send_html(_DASHBOARD_HTML)
@@ -1611,6 +1661,13 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
 
         def do_POST(self) -> None:
+            if not self._is_valid_host() or not self._is_valid_origin():
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "Forbidden Host or Origin."})
+                return
+            csrf_hdr = self.headers.get("X-Kavach-CSRF", "")
+            if not csrf_hdr or not hmac.compare_digest(csrf_hdr, state.csrf_token):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": "Missing or invalid CSRF token."})
+                return
             parsed = urlparse(self.path)
             if parsed.path == "/api/run":
                 ok, msg = state.start_pipeline()
