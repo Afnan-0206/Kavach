@@ -695,7 +695,9 @@ def main() -> int:
 
     here = Path(__file__).resolve().parent
     policy_path = here / "config" / "policy.yaml"
-    return run_pipeline(Path(args.input), Path(args.output), policy_path)
+    inp_path = Path(args.input.strip("'\""))
+    out_path = Path(args.output.strip("'\""))
+    return run_pipeline(inp_path, out_path, policy_path)
 
 
 if __name__ == "__main__":
