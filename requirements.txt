@@ -1,0 +1,6 @@
+cryptography>=42.0.0
+PyYAML>=6.0.1
+rapidfuzz>=3.9.0
+indic-transliteration>=2.3.50
+regex>=2024.5.15
+pytest>=8.0.0

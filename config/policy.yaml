@@ -1,0 +1,13 @@
+# KAVACH-FHIR Privacy Policy Configuration
+age_band_years: 5
+date_shift_max_days: 180
+min_group_size: 5
+pin_prefix_digits: 3
+suppress_rare_pin: true
+suppress_village: true
+preserve_clinician_names: true
+preserve_clinical_values: true
+linkage_auto_merge_threshold: 0.88
+linkage_min_independent_clues: 2
+max_json_depth: 500
+max_file_size_mb: 50
