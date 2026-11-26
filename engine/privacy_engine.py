@@ -147,12 +147,11 @@ def choose_collision_safe_shift(
         if _is_safe(cand):
             return cand
 
-    # Deterministic fallback sweep within [-max_days, +max_days], then [-365, +365]
-    for radius in (max_days, 365):
-        for delta in range(1, radius + 1):
-            for cand in (delta, -delta):
-                if _is_safe(cand):
-                    return cand
+    # Deterministic fallback sweep strictly within configured [-max_days, +max_days]
+    for delta in range(1, max_days + 1):
+        for cand in (delta, -delta):
+            if _is_safe(cand):
+                return cand
 
     raise ValueError("Unable to find a collision-safe date shift outside protected DOBs")
 

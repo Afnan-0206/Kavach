@@ -39,6 +39,9 @@ def _name_similarity(n1: str, n2: str) -> float:
     return fuzz.token_sort_ratio(s1, s2) / 100.0
 
 
+_GENERIC_MRN_PREFIXES = {"UHID", "MRN", "PAT", "REG", "IPD", "OPD", "ADM", "IP", "SMP", "LAB"}
+
+
 def _cannot_link(c1: dict, c2: dict) -> bool:
     """Return True if two clue dicts have contradictory evidence (must NEVER merge)."""
     g1, g2 = c1.get("gender"), c2.get("gender")
@@ -58,14 +61,30 @@ def _cannot_link(c1: dict, c2: dict) -> bool:
         if v1 and v2 and v1 != v2:
             return True
 
-    # Different MRNs from the same hospital prefix (e.g., JJH- vs JJH-, SNJ- vs SNJ-)
-    m1s = {_norm_mrn(x) for x in c1.get("mrns", ()) if x}
-    m2s = {_norm_mrn(x) for x in c2.get("mrns", ()) if x}
-    if m1s and m2s and m1s.isdisjoint(m2s):
-        p1 = {re.match(r"^[A-Z]+", m).group(0) for m in m1s if re.match(r"^[A-Z]+", m)}
-        p2 = {re.match(r"^[A-Z]+", m).group(0) for m in m2s if re.match(r"^[A-Z]+", m)}
-        if p1 & p2:
-            return True
+    has_verified_gov_id_match = any(
+        c1.get(k) and c2.get(k) and c1[k] == c2[k]
+        for k in ("aadhaar", "abha", "pan")
+    )
+
+    # Different MRNs from the same facility-specific prefix (e.g., SNJ- vs SNJ-, JJH- vs JJH-).
+    # Generic prefixes (UHID, MRN, PAT, REG) are used by unrelated hospitals and must not block linkage,
+    # and verified government ID matches override facility-prefix conflicts.
+    if not has_verified_gov_id_match:
+        m1s = {_norm_mrn(x) for x in c1.get("mrns", ()) if x}
+        m2s = {_norm_mrn(x) for x in c2.get("mrns", ()) if x}
+        if m1s and m2s and m1s.isdisjoint(m2s):
+            p1 = {
+                re.match(r"^[A-Z]+", m).group(0)
+                for m in m1s
+                if re.match(r"^[A-Z]+", m) and re.match(r"^[A-Z]+", m).group(0) not in _GENERIC_MRN_PREFIXES
+            }
+            p2 = {
+                re.match(r"^[A-Z]+", m).group(0)
+                for m in m2s
+                if re.match(r"^[A-Z]+", m) and re.match(r"^[A-Z]+", m).group(0) not in _GENERIC_MRN_PREFIXES
+            }
+            if p1 & p2:
+                return True
 
     d1, d2 = c1.get("district"), c2.get("district")
     if d1 and d2 and normalize_person_name(d1) != normalize_person_name(d2):
@@ -109,7 +128,12 @@ class _DisjointSet:
         return True
 
 
-def link_records(units: list[RecordUnit], keyring: KeyRing) -> None:
+def link_records(
+    units: list[RecordUnit],
+    keyring: KeyRing,
+    auto_merge_threshold: float = 0.80,
+    min_independent_clues: int = 2,
+) -> None:
     """Conservatively cluster RecordUnits and assign deterministic HMAC pseudonyms."""
     n = len(units)
     if n == 0:
@@ -173,7 +197,7 @@ def link_records(units: list[RecordUnit], keyring: KeyRing) -> None:
             continue
         ca, cb = clues_list[a], clues_list[b]
         sim = _name_similarity(ca.get("name", ""), cb.get("name", ""))
-        if sim < 0.80:
+        if sim < min(0.80, auto_merge_threshold):
             continue
 
         corroborations = 0
@@ -192,7 +216,7 @@ def link_records(units: list[RecordUnit], keyring: KeyRing) -> None:
                     if ca.get("gender") and cb.get("gender") and ca["gender"] == cb["gender"]:
                         corroborations += 1
 
-        if corroborations >= 2:
+        if corroborations >= min_independent_clues:
             dsu.try_union(a, b)
 
     # Assign deterministic canonical key and collision-checked HMAC pseudonym per cluster

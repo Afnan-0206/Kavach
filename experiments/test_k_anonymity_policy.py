@@ -1,6 +1,7 @@
 """Standalone k-anonymity adaptive generalization experiment & tests (no production edits)."""
 from __future__ import annotations
 
+import argparse
 import csv
 import datetime as dt
 import io
@@ -9,6 +10,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -483,13 +485,59 @@ def _run_attacks(out_dir: Path, att_dir: Path, truth: dict) -> dict:
 
 
 if __name__ == "__main__":
-    base_out = Path(r"C:\Users\hp\devforge\Kavach-FHIR\output\kavach-spec-final")
-    exp_root = Path(r"C:\Users\hp\.gemini\antigravity\brain\706c3fd8-9458-4b26-b6d8-2f5abaf51927\scratch\k_anon_exps")
-    att_dir = Path(r"C:\Users\hp\devforge\Secret-Wards-ToolKit-LF\dev\attacker")
-    truth_path = Path(r"C:\Users\hp\devforge\Secret-Wards-ToolKit-LF\dev\truth\truth.json")
-    input_dir = Path(r"C:\Users\hp\devforge\Secret-Wards-ToolKit-LF\dev\input")
-    check_dev = Path(r"C:\Users\hp\devforge\Secret-Wards-ToolKit-LF\check_dev.py")
-    validate_out = Path(r"C:\Users\hp\devforge\Secret-Wards-ToolKit-LF\validate_output.py")
+    parser = argparse.ArgumentParser(
+        description="Run standalone k-anonymity adaptive generalization experiment (Policies D, E, F).",
+        epilog=(
+            "PowerShell example:\n"
+            "  python experiments\\test_k_anonymity_policy.py "
+            "--baseline-output .\\output\\kavach-clinical-recovery-verify "
+            "--toolkit ..\\Secret-Wards-ToolKit-LF "
+            "--experiment-output .\\output\\k_anon_exps"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--baseline-output", required=True, help="Existing baseline output directory")
+    parser.add_argument("--toolkit", required=True, help="Secret-Wards toolkit directory")
+    parser.add_argument("--experiment-output", required=True, help="Destination directory for experimental policy outputs")
+    args = parser.parse_args()
+
+    base_out = Path(args.baseline_output).expanduser().resolve()
+    toolkit_dir = Path(args.toolkit).expanduser().resolve()
+    exp_root = Path(args.experiment_output).expanduser().resolve()
+
+    att_dir = toolkit_dir / "dev" / "attacker"
+    truth_path = toolkit_dir / "dev" / "truth" / "truth.json"
+    input_dir = toolkit_dir / "dev" / "input"
+    check_dev = toolkit_dir / "check_dev.py"
+    validate_out = toolkit_dir / "validate_output.py"
+
+    for req_dir, label in (
+        (base_out, "--baseline-output"),
+        (base_out / "sanitized", "--baseline-output/sanitized"),
+        (toolkit_dir, "--toolkit"),
+        (att_dir, "toolkit dev/attacker"),
+        (input_dir, "toolkit dev/input"),
+    ):
+        if not req_dir.is_dir():
+            raise SystemExit(f"Error: Required directory not found ({label}): {req_dir}")
+
+    for req_file, label in (
+        (base_out / "report.json", "baseline report.json"),
+        (base_out / "records.jsonl", "baseline records.jsonl"),
+        (truth_path, "toolkit dev/truth/truth.json"),
+        (check_dev, "toolkit check_dev.py"),
+        (validate_out, "toolkit validate_output.py"),
+    ):
+        if not req_file.is_file():
+            raise SystemExit(f"Error: Required file not found ({label}): {req_file}")
+
+    if exp_root.exists() and any(exp_root.iterdir()):
+        raise SystemExit(
+            f"Error: --experiment-output already exists and is non-empty: {exp_root}. "
+            "Provide a fresh destination path to avoid overwriting existing outputs."
+        )
+    exp_root.mkdir(parents=True, exist_ok=True)
+
     truth = json.loads(truth_path.read_text(encoding="utf-8"))
 
     for mode in ("BASELINE", "D", "E", "F"):
@@ -499,13 +547,13 @@ if __name__ == "__main__":
         else:
             target_dir = exp_root / f"policy_{mode.lower()}"
             if target_dir.exists():
-                shutil.rmtree(target_dir)
+                raise SystemExit(f"Error: Target experiment directory already exists: {target_dir}")
             shutil.copytree(base_out, target_dir)
             p_res = apply_k_anonymity_policy(target_dir / "sanitized", mode)
 
         atk = _run_attacks(target_dir, att_dir, truth)
-        cd = subprocess.run(["python", str(check_dev), "--output", str(target_dir), "--truth", str(truth_path)], capture_output=True, text=True)
-        vo = subprocess.run(["python", str(validate_out), "--input", str(input_dir), "--output", str(target_dir)], capture_output=True, text=True)
+        cd = subprocess.run([sys.executable, str(check_dev), "--output", str(target_dir), "--truth", str(truth_path)], capture_output=True, text=True)
+        vo = subprocess.run([sys.executable, str(validate_out), "--input", str(input_dir), "--output", str(target_dir)], capture_output=True, text=True)
         med = next((l.strip() for l in cd.stdout.splitlines() if "MEDICAL DATA KEPT" in l), "")
         print(f"=== {mode} ===")
         print("  policy:", p_res)

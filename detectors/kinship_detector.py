@@ -4,11 +4,12 @@ from __future__ import annotations
 import re
 
 from engine.clinical_shield import overlaps_protected
+from engine.normalization import map_norm_span, normalize_with_map
 from engine.record_model import EntitySpan
 
 # Latin kinship markers: prefix is case-insensitive, name MUST start with uppercase [A-Z]
 _LATIN_KINSHIP_RE = re.compile(
-    r"(?i:\b(?:S/o|D/o|W/o|C/O|M/o|F/o|H/o|Guardian|Relative(?:[ \t]+Name)?|"
+    r"(?<![A-Za-z]/)(?i:\b(?:S/o|D/o|W/o|C/O|M/o|F/o|H/o|Guardian|Relative(?:[ \t]+Name)?|"
     r"Attendant(?:[ \t]+Name)?|Attender|Next[ \t]+of[ \t]+Kin|Caregiver|Contact[ \t]+Person|"
     r"Father(?:'s)?(?:[ \t]+Name)?|Husband(?:'s)?(?:[ \t]+Name)?|Mother(?:'s)?(?:[ \t]+Name)?|"
     r"Wife(?:'s)?(?:[ \t]+Name)?|Pita/Pati[ \t]+ka[ \t]+Naam)[ \t]*[:\-]?[ \t]*"
@@ -33,23 +34,31 @@ _NON_NAME_TAIL = {"age", "dob", "uhid", "ipd", "mobile", "phone", "address", "wa
 
 def detect_kinship(text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
     """Detect relative names anchored by kinship markers, respecting ClinicalShield."""
+    scan_text, idx_map = normalize_with_map(text)
+    if not scan_text:
+        return []
     spans: list[EntitySpan] = []
 
     for rx in (_LATIN_KINSHIP_RE, _DEVA_KINSHIP_RE, _DEVA_PRE_KINSHIP_RE):
-        for m in rx.finditer(text):
-            start, end = m.start(1), m.end(1)
-            if overlaps_protected(start, end, protected):
-                continue
-            name = m.group(1).strip(" .,;:")
+        for m in rx.finditer(scan_text):
+            raw_g = m.group(1)
+            name = raw_g.strip(" .,;:")
             parts = name.split()
             while parts and parts[-1].lower() in _NON_NAME_TAIL:
                 parts.pop()
             if not parts:
                 continue
             clean_name = " ".join(parts)
+            lead = len(raw_g) - len(raw_g.lstrip(" .,;:"))
+            ns = m.start(1) + lead
+            ne = ns + len(clean_name)
+            start, end = map_norm_span(idx_map, ns, ne)
+            full_start, _ = map_norm_span(idx_map, m.start(0), ne)
+            if end <= start or overlaps_protected(full_start, end, protected):
+                continue
             spans.append(EntitySpan(
                 start=start,
-                end=start + len(clean_name),
+                end=end,
                 entity_type="RELATIVE_NAME",
                 text=clean_name,
                 role="relative",

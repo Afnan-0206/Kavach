@@ -1,17 +1,17 @@
-# KAVACH-FHIR — Final Release-Candidate Red-Team Audit
+# KAVACH-FHIR — Final Release-Candidate Red-Team Audit (Historical Snapshot)
 
-> **Scope & Honesty Note:** This audit was performed offline on Windows 11 (`Python 3.12.10`) using synthetic edge-case fixtures and the truth-hash-matched Secret-Wards practice toolkit (`..\Secret-Wards-ToolKit-LF`). Practice-dataset and local diagnostic numbers are **not** official hidden-evaluator scores, and passing synthetic tests does not prove all possible real-world edge cases are covered.
+> **Historical Snapshot Notice:** This audit records an earlier release-candidate check (`51 passed`, recall `0.87`) prior to the subsequent security remediation and clinical recovery updates. For current release practice results (`78 passed, 1 xfailed`, `0 / 3,230` PII, `4,855 / 4,855` clinical preservation, `1.00` precision, `0.85` recall, `0.97` F0.5, `CONTRACT OK`, `READY TO SUBMIT`), see [README.md](../README.md) and [docs/evaluation.md](evaluation.md).
 
 ---
 
-## 1. Repository & Toolkit Versions / Paths Tested
+## 1. Repository & Toolkit Paths Tested
 
-- **Repository:** `C:\Users\hp\devforge\Kavach-FHIR` (branch `master`, base commit `2894112` + uncommitted working-tree changes)
-- **Official Practice Toolkit (LF-normalized):** `C:\Users\hp\devforge\Secret-Wards-ToolKit-LF`
-  - Practice input: `..\Secret-Wards-ToolKit-LF\dev\input` (`200` files)
-  - Truth file: `..\Secret-Wards-ToolKit-LF\dev\truth\truth.json`
-- **Preserved Baseline Outputs:** `.\output\kavach-final`, `.\output\kavach-spec-final` (left untouched)
-- **Red-Team Verification Output:** `.\output\kavach-redteam-verify`
+- **Repository:** `.` (repository root)
+- **Official Practice Toolkit (LF-normalized):** `../Secret-Wards-ToolKit-LF`
+  - Practice input: `../Secret-Wards-ToolKit-LF/dev/input` (`200` files)
+  - Truth file: `../Secret-Wards-ToolKit-LF/dev/truth/truth.json`
+- **Preserved Baseline Outputs:** `./output/kavach-final`, `./output/kavach-spec-final` (left untouched)
+- **Red-Team Verification Output:** `./output/kavach-redteam-verify`
 - **Fresh Virtual Environment:** `%TEMP%\kavach_rt_venv` (`Python 3.12.10`, `pip install -r requirements.txt`)
 
 ---
@@ -47,13 +47,13 @@ Re-checking the earlier A3/A4/A5 reports against `output\kavach-spec-final` expl
 
 ## 4. Confirmed Defects Found & Minimal Fixes
 
-1. **Cross-line name-token regex bleeding into vitals ([detectors/name_detector.py](file:///C:/Users/hp/devforge/Kavach-FHIR/detectors/name_detector.py)):**
+1. **Cross-line name-token regex bleeding into vitals ([detectors/name_detector.py](../detectors/name_detector.py)):**
    - *Defect:* `_LABELED_NAME_RE` used `\s+` between name tokens, matching across `\n` into `"BP 120/80"` on the next line; `overlaps_protected()` then rejected the entire match, leaking `"मोहन लाल"`.
    - *Fix:* Replaced `\s+` with `[ \t]+` inside `_LABELED_NAME_RE`.
-2. **Underscore-delimited PII in JSON keys ([main.py](file:///C:/Users/hp/devforge/Kavach-FHIR/main.py)):**
+2. **Underscore-delimited PII in JSON keys ([main.py](../main.py)):**
    - *Defect:* `_sanitize_json_obj` checked `gazetteer._compiled_full.search(k)` without normalizing `_`/`-` to spaces, missing `"Kavita_Verma_meta"`.
    - *Fix:* Normalized `k_norm = re.sub(r"[_\-]+", " ", k)` and checked `gazetteer.match(k_norm, [])`, `detect_indian_ids(k_norm)`, and `detect_phones(k_norm)`.
-3. **Missing `DOB:` clue extraction in free text ([main.py](file:///C:/Users/hp/devforge/Kavach-FHIR/main.py)):**
+3. **Missing `DOB:` clue extraction in free text ([main.py](../main.py)):**
    - *Defect:* `_extract_clues_from_text` did not parse `DOB:` / `Date of Birth:` / `जन्म तिथि:` lines, preventing cross-script notes with only `Name + Age + DOB` from linking.
    - *Fix:* Added `DOB` extraction via `parse_date_flexible`, which also improved practice-dataset linkage recall from `0.85` to **`0.87`** (`1.00` precision, `0` false merges).
 
@@ -71,7 +71,7 @@ Re-checking the earlier A3/A4/A5 reports against `output\kavach-spec-final` expl
 
 1. **`python -m pytest -v`**: **`51 passed in 6.01s`** (includes `tests/` + `experiments/test_k_anonymity_policy.py`)
 2. **`python main.py --input ..\Secret-Wards-ToolKit-LF\dev\input --output .\output\kavach-redteam-verify`** (temp `RAKSHA_SECRET` via env): `files 200 sanitized 193 quarantined 7 records 822`, exit code `0`
-3. **`python ..\Secret-Wards-ToolKit-LF\check_dev.py --output .\output\kavach-redteam-verify --truth ..\Secret-Wards-ToolKit-LF\dev\truth\truth.json --show 30`**:
+3. **`python ..\Secret-Wards-ToolKit-LF\check_dev.py --output .\output\kavach-redteam-verify --truth ..\Secret-Wards-ToolKit-LF\dev\truth\truth.json`**:
    - **Personal data:** `0 / 3,230` (`0.0%` across all 16 types, all scripts, all hiding places)
    - **Canaries:** `0 / 4`
    - **Medical data kept:** `4,855 / 4,855` (`100.0%`)

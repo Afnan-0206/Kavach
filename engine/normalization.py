@@ -55,6 +55,31 @@ def normalize_text(text: str) -> str:
     return s
 
 
+def normalize_with_map(text: str) -> tuple[str, list[int]]:
+    """Normalize text while returning a per-character index map back to original `text` offsets."""
+    if not text:
+        return "", []
+    if text.isascii():
+        return text, list(range(len(text)))
+    out_chars: list[str] = []
+    idx_map: list[int] = []
+    for i, ch in enumerate(text):
+        if _ZERO_WIDTH_RE.match(ch):
+            continue
+        folded = unicodedata.normalize("NFKC", ch).translate(_HOMOGLYPHS).translate(_INDIC_DIGITS)
+        for out_ch in folded:
+            out_chars.append(out_ch)
+            idx_map.append(i)
+    return "".join(out_chars), idx_map
+
+
+def map_norm_span(idx_map: list[int], norm_start: int, norm_end: int) -> tuple[int, int]:
+    """Map [norm_start, norm_end) in normalized text back to [orig_start, orig_end) in original text."""
+    if norm_start >= norm_end or not idx_map or norm_end > len(idx_map):
+        return 0, 0
+    return idx_map[norm_start], idx_map[norm_end - 1] + 1
+
+
 def strip_diacritics(text: str) -> str:
     """Remove combining diacritical marks from Latin text."""
     nfd = unicodedata.normalize("NFD", text)

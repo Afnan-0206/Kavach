@@ -1,7 +1,7 @@
 # KAVACH-FHIR Privacy Policy Configuration
 age_band_years: 5
 date_shift_max_days: 180
-min_group_size: 5
+# Note: adaptive k-anonymity suppression (min_group_size) is intentionally disabled; see docs/k_anonymity_experiment.md
 pin_prefix_digits: 3
 suppress_rare_pin: true
 suppress_village: true

@@ -1,6 +1,6 @@
 # KAVACH-FHIR — Equivalence-Class-Driven Privacy Experiment (Policies D, E, F)
 
-> **Scope & Disclaimer:** Executed offline via [test_k_anonymity_policy.py](file:///C:/Users/hp/devforge/Kavach-FHIR/experiments/test_k_anonymity_policy.py) on isolated copies of `output/kavach-spec-final` against the practice dataset (`Secret-Wards-ToolKit-LF/dev/input` and `dev/attacker/`). All metrics are local diagnostic estimates, not official hidden-evaluation scores. No production code or verified submission outputs were modified.
+> **Historical Snapshot Notice:** Executed offline via [test_k_anonymity_policy.py](../experiments/test_k_anonymity_policy.py) on isolated copies of an earlier baseline (`output/kavach-spec-final`) against the practice dataset (`../Secret-Wards-ToolKit-LF/dev/input` and `dev/attacker/`). Preserve these as historical experimental measurements; current release practice results are `78 passed, 1 xfailed`, `0 / 3,230` PII, `4,855 / 4,855` clinical preservation, `1.00` precision, `0.85` recall, `0.97` F0.5, `CONTRACT OK`, and `READY TO SUBMIT`.
 
 ---
 

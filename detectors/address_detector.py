@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from engine.normalization import normalize_text
+from engine.normalization import map_norm_span, normalize_with_map
 from engine.record_model import EntitySpan
 
 _HOUSE_RE = re.compile(
@@ -34,36 +34,50 @@ _VILLAGE_RE = re.compile(
 )
 
 _PIN_RE = re.compile(
-    r"(?:(?:PIN|Pin\s*Code|Zip|पिन)\s*[:\-]?\s*|,\s*|-\s*)([1-8]\d{5})\b",
+    r"(?:(?:PIN|Pin\s*Code|Zip|पिन)\s*[:\-]?\s*|,\s*|(?<![\d.])-\s*)([1-8]\d{5})\b",
     re.IGNORECASE,
 )
 
 
 def detect_addresses(text: str) -> list[EntitySpan]:
     """Detect house numbers, localities, landmarks, villages, and PIN codes."""
-    norm = normalize_text(text)
-    target = norm if len(norm) == len(text) else text
+    target, idx_map = normalize_with_map(text)
+    if not target:
+        return []
     spans: list[EntitySpan] = []
 
+    def _add(ns: int, ne: int, etype: str, val: str) -> None:
+        os_, oe_ = map_norm_span(idx_map, ns, ne)
+        if oe_ > os_:
+            spans.append(EntitySpan(os_, oe_, etype, val))
+
     for m in _HOUSE_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "HOUSE", m.group(0)))
+        _add(m.start(), m.end(), "HOUSE", m.group(0))
 
     for m in _LOCALITY_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "LOCALITY", m.group(0).strip()))
+        raw_g = m.group(0)
+        val = raw_g.strip()
+        lead = len(raw_g) - len(raw_g.lstrip())
+        _add(m.start() + lead, m.start() + lead + len(val), "LOCALITY", val)
 
     for m in _WARD_LOCALITY_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "LOCALITY", m.group(0)))
+        _add(m.start(), m.end(), "LOCALITY", m.group(0))
 
     for m in _LANDMARK_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "LANDMARK", m.group(0).strip()))
+        raw_g = m.group(0)
+        val = raw_g.strip()
+        lead = len(raw_g) - len(raw_g.lstrip())
+        _add(m.start() + lead, m.start() + lead + len(val), "LANDMARK", val)
 
     for m in _VILLAGE_RE.finditer(target):
         grp = 1 if m.group(1) is not None else 2
-        val = m.group(grp).strip()
+        raw_g = m.group(grp)
+        val = raw_g.strip()
         if not any(w in val.lower() for w in ("mohalla", "ward", "near ", "opp", "house", "makan", "h.no")):
-            spans.append(EntitySpan(m.start(grp), m.end(grp), "VILLAGE", val))
+            lead = len(raw_g) - len(raw_g.lstrip())
+            _add(m.start(grp) + lead, m.start(grp) + lead + len(val), "VILLAGE", val)
 
     for m in _PIN_RE.finditer(target):
-        spans.append(EntitySpan(m.start(1), m.end(1), "PIN", m.group(1)))
+        _add(m.start(1), m.end(1), "PIN", m.group(1))
 
     return spans

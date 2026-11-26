@@ -87,47 +87,70 @@ Configured via `config/policy.yaml`:
 ## 10. Security Model
 
 - No LLMs, no generative models, no pretrained transformers, and no network calls during execution.
-- `RAKSHA_SECRET` is read solely from the environment and never logged, printed, or written to disk.
+- `RAKSHA_SECRET` is read solely from the environment and never logged, printed, or written to disk (minimum 16 bytes / 128 bits recommended; emits a warning if shorter).
 - Raw input data and intermediate structures (`IngestedFile`, `RecordUnit`, `clues`, `DynamicGazetteer`) are held strictly in memory and never written to disk; only already-sanitized outputs, `records.jsonl`, and `report.json` are written atomically via `tempfile.mkstemp` + `os.replace`.
-- `KeyRing` includes unit-tested AES-256-GCM helpers (`encrypt_bytes` / `decrypt_bytes`) for any future encrypted temp-file needs, though no disk intermediates are created in the current pipeline.
+- Symlinks and Windows reparse points inside `--input` are rejected and quarantined (`symlink_or_path_escape`) without reading external targets.
 - Unprocessable or malformed files are quarantined (`output/report.json` lists SHA-256 + reason) and never copied raw into `sanitized/`.
+- Local browser dashboard (`dashboard.py`) binds strictly to `127.0.0.1`, enforces `Host`, `Origin`/`Referer`, and per-session `X-Kavach-CSRF` validation on `POST` endpoints, and enforces realpath containment strictly under `sanitized/`.
 
 ## 11. Installation
 
+Requires Python 3.12+ (works on fresh Windows or Linux installations):
+
 ```bash
+python -m venv .venv
+# Linux/macOS: source .venv/bin/activate
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
 Dependencies: `cryptography`, `PyYAML`, `rapidfuzz`, `indic-transliteration`, `pytest`.
 
-## 12. Execution
+## 12. Execution (CLI & Local Dashboard)
 
-`RAKSHA_SECRET` is **required** (non-empty, non-whitespace) and fails closed before creating any output directory if unset or blank.
+`RAKSHA_SECRET` is **required** (non-empty, non-whitespace; generate a random 32-byte hex secret locally) and fails closed before creating any output directory if unset or blank. Never commit or reuse a real secret in files or logs.
 
 **PowerShell (Windows):**
 ```powershell
-$env:RAKSHA_SECRET="your-secret-key"
+$env:RAKSHA_SECRET = python -c "import secrets; print(secrets.token_hex(32))"
 python main.py --input ..\Secret-Wards-ToolKit-LF\dev\input --output .\output\kavach-final
 ```
 
 **Bash (Linux/macOS):**
 ```bash
-export RAKSHA_SECRET="your-secret-key"
-python main.py --input /path/to/input --output /path/to/output
+export RAKSHA_SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+python3 main.py --input /path/to/input --output ./output/kavach-final
 ```
 
-## 13. Testing
-
+**Local Browser Dashboard (`127.0.0.1` only):**
+Pass `--toolkit` when running practice evaluation from the dashboard UI:
 ```powershell
-python -m pytest -v tests\
+python dashboard.py --input ..\Secret-Wards-ToolKit-LF\dev\input --output .\output\kavach-dash --toolkit ..\Secret-Wards-ToolKit-LF
+```
+Open `http://127.0.0.1:8765/` in a local browser.
+
+## 13. Testing & Official Practice Evaluation
+
+**Unit & Security Regression Suite:**
+```bash
+python -m pytest -v
+```
+Latest result: **`78 passed, 1 xfailed`** (the single expected failure is the documented unlabeled mid-sentence free-text name limitation).
+
+**Official Practice Evaluation & Submission Verification:**
+```bash
+python validate_output.py --input <practice_input> --output <output_dir>
+python check_dev.py --output <output_dir> --truth <practice_truth.json>
+python check_submission.py --repo . --run
 ```
 
 ## 14. Measured Performance (Practice Dataset)
 
-Measured on the supplied practice/development dataset (`Secret-Wards-ToolKit-LF/dev/input`: **200 files**, **193 sanitized**, **7 quarantined**, **822 exported records**). These are practice-dataset measurements, **not** hidden-evaluation scores, and zero leakage on practice data does not guarantee zero leakage on arbitrary real-world datasets.
+Measured on the supplied practice/development dataset (`dev/input`: **200 files**, **193 sanitized**, **7 quarantined**, **822 exported records**). These are **practice-dataset results only, not hidden-evaluation guarantees**, and zero leakage on practice data does not guarantee zero leakage on arbitrary real-world datasets.
 
 | Metric | Result |
 |---|---:|
+| Unit & security test suite (`pytest`) | **78 passed, 1 xfailed** |
 | PII leakage (`check_dev.py`) | **0 / 3,230** |
 | Canaries leaked | **0 / 4** |
 | Clinical preservation | **4,855 / 4,855** (100.0%) |
@@ -137,7 +160,7 @@ Measured on the supplied practice/development dataset (`Secret-Wards-ToolKit-LF/
 | False merges | **0** |
 | Raw unsupported copies | **0** |
 | Output contract (`validate_output.py`) | **`CONTRACT OK`** (193 sanitized, 7 quarantined) |
-| Runtime (CPU) | **~8.5–10.2 seconds** |
+| Full submission checker (`check_submission.py`) | **`READY TO SUBMIT`** |
 
 **Conservative Linkage Trade-off:** KAVACH-FHIR enforces cluster-wide cannot-link constraints and requires multi-point corroboration when strong IDs are absent. This yields **1.00 precision** and **0 false merges** at the cost of **0.85 recall** (leaving genuinely ambiguous or sparsely corroborated records unlinked as `patient: null`).
 

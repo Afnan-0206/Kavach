@@ -21,13 +21,22 @@ from dashboard import (
 )
 
 
-def _http_json(url: str, method: str = "GET") -> tuple[int, dict]:
-    req = urllib.request.Request(url, method=method)
+def _http_json(url: str, method: str = "GET", headers: dict[str, str] | None = None) -> tuple[int, dict]:
+    req = urllib.request.Request(url, method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         return err.code, json.loads(err.read().decode("utf-8"))
+
+
+def _fetch_csrf(base: str) -> str:
+    with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+        body = resp.read().decode("utf-8")
+    import re as _re
+    m = _re.search(r'<meta name="kavach-csrf" content="([^"]+)"', body)
+    assert m is not None
+    return m.group(1)
 
 
 def test_dashboard_no_external_network_or_api_keys():
@@ -83,7 +92,8 @@ def test_missing_secret_fails_closed_and_never_leaks_secret(tmp_path: Path, monk
         assert code == 200
         assert st["secret_configured"] is False
 
-        code_run, res_run = _http_json(f"{base}/api/run", method="POST")
+        csrf = _fetch_csrf(base)
+        code_run, res_run = _http_json(f"{base}/api/run", method="POST", headers={"X-Kavach-CSRF": csrf})
         assert code_run == 400
         assert res_run["ok"] is False
         assert "RAKSHA_SECRET" in res_run["error"]
@@ -118,7 +128,8 @@ def test_successful_run_preview_escaping_traversal_and_no_secret_leak(tmp_path: 
             assert "function esc(s)" in html_body
             assert secret_val not in html_body
 
-        code, run_res = _http_json(f"{base}/api/run", method="POST")
+        csrf = _fetch_csrf(base)
+        code, run_res = _http_json(f"{base}/api/run", method="POST", headers={"X-Kavach-CSRF": csrf})
         assert code == 202 and run_res["ok"] is True
 
         # Poll until pipeline completes
@@ -172,7 +183,8 @@ def test_failed_pipeline_run_does_not_expose_traceback(tmp_path: Path, monkeypat
     t.start()
     base = f"http://127.0.0.1:{srv.server_port}"
     try:
-        _http_json(f"{base}/api/run", method="POST")
+        csrf = _fetch_csrf(base)
+        _http_json(f"{base}/api/run", method="POST", headers={"X-Kavach-CSRF": csrf})
         st = None
         for _ in range(30):
             _, st = _http_json(f"{base}/api/status")
@@ -215,3 +227,41 @@ def test_report_and_evaluator_parsers():
     assert m["false_merges"] == "0"
     assert parse_validate_output("CONTRACT OK\n", 0) == "CONTRACT OK"
     assert parse_report_json(Path("nonexistent_report.json"))["available"] is False
+
+
+def test_dashboard_csrf_origin_host_and_no_inline_onclick(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("RAKSHA_SECRET", "dashboard-csrf-test-secret-1234")
+    inp = tmp_path / "in"
+    inp.mkdir()
+    (inp / "note.txt").write_text("C/O: fever\n", encoding="utf-8")
+    out = tmp_path / "out"
+
+    srv, _ = create_server(inp, out, port=0)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        csrf = _fetch_csrf(base)
+        # Missing CSRF token -> 403
+        c1, r1 = _http_json(f"{base}/api/run", method="POST")
+        assert c1 == 403 and "CSRF" in r1["error"]
+
+        # Cross-origin POST even with token -> 403
+        c2, r2 = _http_json(
+            f"{base}/api/run",
+            method="POST",
+            headers={"X-Kavach-CSRF": csrf, "Origin": "http://evil.example:9999"},
+        )
+        assert c2 == 403 and "Origin" in r2["error"]
+
+        # Invalid Host header (DNS rebinding) -> 403
+        c3, _ = _http_json(f"{base}/api/status", headers={"Host": "evil.example:8765"})
+        assert c3 == 403
+
+        # No inline onclick interpolation for filenames/folders
+        assert "onclick=\"loadPreview" not in _DASHBOARD_HTML
+        assert "onclick=\"setFolderFilter" not in _DASHBOARD_HTML
+        assert 'data-path="${esc(f)}"' in _DASHBOARD_HTML
+    finally:
+        srv.shutdown()
+        srv.server_close()

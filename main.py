@@ -302,7 +302,6 @@ def _selective_out_rel(
 ) -> tuple[str, bool]:
     """Preserve safe path components; deterministically rename only PII-bearing components."""
     p = Path(rel_path)
-    is_clean_ref = rel_path.startswith("clean/")
     any_renamed = False
     safe_parts: list[str] = []
     acc_parts: list[str] = []
@@ -311,7 +310,7 @@ def _selective_out_rel(
             continue
         acc_parts.append(part)
         dir_key = "/".join(acc_parts)
-        if not is_clean_ref and _component_has_pii(part, gazetteer):
+        if _component_has_pii(part, gazetteer):
             any_renamed = True
             if dir_key not in dir_map:
                 dir_map[dir_key] = f"dir_{keyring.safe_file_token(dir_key)}"
@@ -321,7 +320,7 @@ def _selective_out_rel(
 
     ext = p.suffix.lower() if p.suffix else ""
     stem = p.stem
-    if not is_clean_ref and _component_has_pii(stem, gazetteer):
+    if _component_has_pii(stem, gazetteer):
         any_renamed = True
         salt = 0
         while True:
@@ -348,6 +347,36 @@ def _selective_out_rel(
         salt += 1
 
 
+def _sanitize_json_key(
+    k: str,
+    gazetteer: DynamicGazetteer,
+    stats: PipelineStats,
+    pseudonym: str | None,
+    shift_days: int,
+    use_clinical_shield: bool = True,
+) -> str:
+    """Sanitize PII or dates embedded inside JSON keys while preserving safe schema keys."""
+    if not k:
+        return k
+    k_space = re.sub(r"_+", " ", k)
+    k_flat = re.sub(r"[_\-]+", " ", k)
+    k_has_dates = bool(extract_dates_in_text(k_space))
+    k_has_pii = bool(
+        detect_all_spans(k, gazetteer=gazetteer, use_clinical_shield=use_clinical_shield)
+        or detect_all_spans(k_space, gazetteer=gazetteer, use_clinical_shield=use_clinical_shield)
+        or detect_all_spans(k_flat, gazetteer=gazetteer, use_clinical_shield=use_clinical_shield)
+    )
+    if not k_has_dates and not k_has_pii:
+        return k
+    base = k_space if (k_has_dates or detect_all_spans(k_space, gazetteer=gazetteer, use_clinical_shield=use_clinical_shield)) else k_flat
+    cleaned = redact_text(
+        base, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym,
+        use_clinical_shield=use_clinical_shield,
+    )
+    cleaned = shift_date_str(cleaned, shift_days)
+    return cleaned
+
+
 def _sanitize_json_obj(
     obj: Any,
     gazetteer: DynamicGazetteer,
@@ -358,6 +387,10 @@ def _sanitize_json_obj(
     pin_prefix: int,
     in_fhir_practitioner_or_org: bool = False,
     parent_key: str = "",
+    suppress_rare_pin: bool = True,
+    suppress_village: bool = True,
+    preserve_clinician_names: bool = True,
+    use_clinical_shield: bool = True,
 ) -> Any:
     if isinstance(obj, dict):
         rt = obj.get("resourceType")
@@ -378,18 +411,12 @@ def _sanitize_json_obj(
                     new_dict[k] = "[ADDRESS]"
                     stats.add_entity("HOUSE")
                     continue
-            # Sanitize PII in JSON keys
-            new_k = k
-            k_norm = re.sub(r"[_\-]+", " ", k) if ("_" in k or "-" in k) else k
-            k_has_id = any(c.isdigit() or c == "@" for c in k)
-            if (
-                (k_has_id and (detect_indian_ids(k) or detect_indian_ids(k_norm) or detect_phones(k) or detect_phones(k_norm)))
-                or (len(k_norm) >= 4 and gazetteer.match(k_norm, []))
-            ):
-                new_k = redact_text(k_norm, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym)
+            new_k = _sanitize_json_key(
+                k, gazetteer, stats, pseudonym, shift_days, use_clinical_shield=use_clinical_shield
+            )
 
             cls = classify_field_name(k)
-            if is_clinical_actor and k in ("name", "text", "qualification", "address"):
+            if is_clinical_actor and preserve_clinician_names and k in ("name", "text", "qualification", "address"):
                 new_dict[new_k] = v
                 continue
 
@@ -440,36 +467,65 @@ def _sanitize_json_obj(
                     new_dict[new_k] = pseudonym if pseudonym else "[MRN]"
                     stats.add_entity("MRN")
                 elif cls == "PIN":
-                    new_dict[new_k] = generalize_pin(sv, pin_prefix)
+                    new_dict[new_k] = generalize_pin(sv, pin_prefix) if suppress_rare_pin else v
                     stats.add_entity("PIN")
                 elif cls == "VILLAGE":
-                    new_dict[new_k] = "[VILLAGE]"
+                    new_dict[new_k] = "[VILLAGE]" if suppress_village else v
                     stats.add_entity("VILLAGE")
                 elif cls == "ADDRESS":
                     new_dict[new_k] = "[ADDRESS]"
                     stats.add_entity("HOUSE")
-                elif cls == "AGE" and isinstance(v, int):
-                    new_dict[new_k] = age_to_band(v, age_band_w)
+                elif cls == "AGE":
+                    if isinstance(v, int):
+                        new_dict[new_k] = age_to_band(v, age_band_w)
+                        stats.records_generalized += 1
+                    elif isinstance(v, str):
+                        nv = normalize_text(sv)
+                        m_as = _AGE_SEX_CELL_RE.match(nv)
+                        if m_as:
+                            new_dict[new_k] = f"{age_to_band(int(m_as.group(1)), age_band_w)}{m_as.group(2)}"
+                            stats.records_generalized += 1
+                        elif nv.isdigit():
+                            new_dict[new_k] = age_to_band(int(nv), age_band_w)
+                            stats.records_generalized += 1
+                        else:
+                            new_dict[new_k] = _AGE_INLINE_RE.sub(
+                                lambda m: f"{m.group(1)}{age_to_band(int(m.group(2)), age_band_w)}{m.group(3)}",
+                                redact_text(sv, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield),
+                            )
                 elif cls in ("DOB", "DATE") or k in ("birthDate", "recordedDate", "authoredOn", "effectiveDateTime", "performedDateTime", "timestamp", "date", "start", "end"):
                     if isinstance(v, str):
                         new_dict[new_k] = shift_date_str(v, shift_days)
                     else:
                         new_dict[new_k] = v
-                elif cls in ("DISTRICT", "GENDER", "CLINICIAN"):
+                elif cls == "CLINICIAN":
+                    new_dict[new_k] = v if preserve_clinician_names else "[CLINICIAN]"
+                elif cls in ("DISTRICT", "GENDER"):
                     new_dict[new_k] = v
+                elif k.lower() == "ward" and isinstance(v, str):
+                    has_res_sibling = any(
+                        classify_field_name(sk) in ("PATIENT_NAME", "RELATIVE_NAME", "ADDRESS", "VILLAGE", "PIN", "PHONE", "AADHAAR", "ABHA_NUMBER", "MRN")
+                        for sk in obj.keys()
+                        if sk != k
+                    )
+                    if not has_res_sibling and re.fullmatch(r"\s*(?:Ward\s+\d+(?:\s*\([^)]+\))?|[A-Za-z\s]{2,30})\s*", sv, re.I) and not re.search(r"\b(?:No\.?|Mohalla|Colony|Nagar|Sector|Gali|Street|Lane|Road|PIN)\b", sv, re.I):
+                        new_dict[new_k] = v
+                    else:
+                        cleaned = redact_text(v, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
+                        new_dict[new_k] = shift_date_str(cleaned, shift_days)
                 elif isinstance(v, str):
                     # Base64 attachment or free-text string
                     if _B64_RE.match(v.strip()):
                         try:
                             dec = base64.b64decode(v.strip() + "=" * (-len(v.strip()) % 4)).decode("utf-8", errors="strict")
                             if dec and sum(ch.isprintable() or ch in "\r\n\t" for ch in dec) / len(dec) >= 0.85:
-                                cleaned = redact_text(dec, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym)
+                                cleaned = redact_text(dec, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
                                 cleaned = shift_date_str(cleaned, shift_days)
                                 new_dict[new_k] = base64.b64encode(cleaned.encode("utf-8")).decode("ascii")
                                 continue
                         except (binascii.Error, UnicodeDecodeError, ValueError):
                             pass
-                    cleaned = redact_text(v, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym)
+                    cleaned = redact_text(v, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
                     cleaned = shift_date_str(cleaned, shift_days)
                     new_dict[new_k] = cleaned
                 else:
@@ -478,6 +534,8 @@ def _sanitize_json_obj(
                 new_dict[new_k] = _sanitize_json_obj(
                     v, gazetteer, stats, pseudonym, shift_days, age_band_w, pin_prefix,
                     in_fhir_practitioner_or_org=is_clinical_actor, parent_key=k,
+                    suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
+                    preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
                 )
         return new_dict
     elif isinstance(obj, list):
@@ -485,11 +543,13 @@ def _sanitize_json_obj(
             _sanitize_json_obj(
                 x, gazetteer, stats, pseudonym, shift_days, age_band_w, pin_prefix,
                 in_fhir_practitioner_or_org=in_fhir_practitioner_or_org, parent_key=parent_key,
+                suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
+                preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
             )
             for x in obj
         ]
     elif isinstance(obj, str):
-        cleaned = redact_text(obj, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym)
+        cleaned = redact_text(obj, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
         return shift_date_str(cleaned, shift_days)
     return obj
 
@@ -501,6 +561,12 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
     age_band_w = int(policy.get("age_band_years", 5))
     max_shift = int(policy.get("date_shift_max_days", 180))
     pin_prefix = int(policy.get("pin_prefix_digits", 3))
+    suppress_rare_pin = bool(policy.get("suppress_rare_pin", True))
+    suppress_village = bool(policy.get("suppress_village", True))
+    preserve_clinician_names = bool(policy.get("preserve_clinician_names", True))
+    use_clinical_shield = bool(policy.get("preserve_clinical_values", True))
+    linkage_auto_merge_threshold = float(policy.get("linkage_auto_merge_threshold", 0.88))
+    linkage_min_independent_clues = int(policy.get("linkage_min_independent_clues", 2))
 
     sanitized_dir = output_dir / "sanitized"
     sanitized_dir.mkdir(parents=True, exist_ok=True)
@@ -529,10 +595,10 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             out_dates.update(extract_dates_in_text(obj))
 
     # PASS 1: Extract clues, dates, and protected DOBs
+    top_json_meta_dates: dict[str, set[dt.date]] = {}
     for item in ingested:
         if item.status != "sanitized":
             continue
-        is_clean_ref = item.rel_path.startswith("clean/")
         units_for_file: list[RecordUnit] = []
 
         if item.fmt in ("csv", "tsv") and item.csv_rows is not None:
@@ -541,12 +607,11 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             for idx, row in enumerate(body):
                 clues: dict[str, Any] = {}
                 row_dates: set[dt.date] = set()
-                if not is_clean_ref:
-                    _extract_clues_from_row(headers, row, month_first, clues, gazetteer)
-                    if clues.get("dob"):
-                        protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
-                    for cell in row:
-                        row_dates.update(extract_dates_in_text(cell, month_first=month_first))
+                _extract_clues_from_row(headers, row, month_first, clues, gazetteer)
+                if clues.get("dob"):
+                    protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
+                for cell in row:
+                    row_dates.update(extract_dates_in_text(cell, month_first=month_first))
                 ru = RecordUnit(
                     file_rel=item.rel_path, out_rel=item.out_rel, loc=f"row:{idx}",
                     raw_text=item.delimiter.join(row), clues=clues,
@@ -565,11 +630,10 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             if is_doc:
                 clues = {}
                 doc_dates: set[dt.date] = set()
-                if not is_clean_ref:
-                    _extract_clues_from_json(data, clues, gazetteer)
-                    if clues.get("dob"):
-                        protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
-                    _collect_json_dates(data, doc_dates)
+                _extract_clues_from_json(data, clues, gazetteer)
+                if clues.get("dob"):
+                    protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
+                _collect_json_dates(data, doc_dates)
                 ru = RecordUnit(
                     file_rel=item.rel_path, out_rel=item.out_rel, loc="doc",
                     raw_text="", clues=clues,
@@ -578,17 +642,17 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                 units_for_file.append(ru)
                 all_units.append(ru)
             else:
+                meta_dates: set[dt.date] = set()
                 for k, v in data.items():
                     if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
                         ptr_k = k.replace("~", "~0").replace("/", "~1")
                         for idx, elem in enumerate(v):
                             clues = {}
                             elem_dates: set[dt.date] = set()
-                            if not is_clean_ref:
-                                _extract_clues_from_json(elem, clues, gazetteer)
-                                if clues.get("dob"):
-                                    protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
-                                _collect_json_dates(elem, elem_dates)
+                            _extract_clues_from_json(elem, clues, gazetteer)
+                            if clues.get("dob"):
+                                protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
+                            _collect_json_dates(elem, elem_dates)
                             ru = RecordUnit(
                                 file_rel=item.rel_path, out_rel=item.out_rel,
                                 loc=f"/{ptr_k}/{idx}", raw_text="", clues=clues,
@@ -596,14 +660,17 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                             )
                             units_for_file.append(ru)
                             all_units.append(ru)
+                    else:
+                        _collect_json_dates(v, meta_dates)
+                if meta_dates:
+                    top_json_meta_dates[f"unlinked|{item.rel_path}:meta"] = meta_dates
         else:
             clues = {}
             txt_dates: set[dt.date] = set()
-            if not is_clean_ref:
-                _extract_clues_from_text(item.text, clues, gazetteer)
-                if clues.get("dob"):
-                    protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
-                txt_dates.update(extract_dates_in_text(item.text))
+            _extract_clues_from_text(item.text, clues, gazetteer)
+            if clues.get("dob"):
+                protected_dobs.add(dt.date.fromisoformat(clues["dob"]))
+            txt_dates.update(extract_dates_in_text(item.text))
             ru = RecordUnit(
                 file_rel=item.rel_path, out_rel=item.out_rel, loc="doc",
                 raw_text=item.text, clues=clues,
@@ -624,10 +691,15 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
         )
         for ru in file_units.get(item.rel_path, []):
             ru.out_rel = item.out_rel
-    link_records(all_units, keyring)
+    link_records(
+        all_units,
+        keyring,
+        auto_merge_threshold=linkage_auto_merge_threshold,
+        min_independent_clues=linkage_min_independent_clues,
+    )
 
     # Resolve collision-safe patient-level date shifts across the entire dataset
-    dates_by_shift_key: dict[str, set[dt.date]] = {}
+    dates_by_shift_key: dict[str, set[dt.date]] = dict(top_json_meta_dates)
     for ru in all_units:
         skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
         dates_by_shift_key.setdefault(skey, set()).update(ru.structured_fields.get("dates", set()))
@@ -645,14 +717,13 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             stats.files_quarantined += 1
             continue
 
-        is_clean_ref = item.rel_path.startswith("clean/")
         units = file_units.get(item.rel_path, [])
 
         if item.fmt in ("csv", "tsv") and item.csv_rows is not None:
             headers, body = item.csv_rows[0], item.csv_rows[1:]
             month_first = any("MM/DD" in h for h in headers)
             clean_headers = [
-                redact_text(h, gazetteer=gazetteer, stats=stats) if not is_clean_ref else h
+                redact_text(h, gazetteer=gazetteer, stats=stats, use_clinical_shield=use_clinical_shield)
                 for h in headers
             ]
             has_mrn_col = any(classify_field_name(h) == "MRN" for h in headers)
@@ -670,16 +741,15 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                 psn_written = False
 
                 for h, cell in zip(headers, row):
-                    if is_clean_ref:
-                        new_row.append(cell)
-                        continue
                     cls = classify_field_name(h)
                     val = cell.strip()
                     if not val:
                         new_row.append(cell)
                         continue
-                    if cls == "CLINICIAN" or cls in ("DISTRICT", "TEHSIL", "GENDER"):
+                    if cls in ("DISTRICT", "TEHSIL", "GENDER"):
                         new_row.append(cell)
+                    elif cls == "CLINICIAN":
+                        new_row.append(cell if preserve_clinician_names else "[CLINICIAN]")
                     elif cls == "MRN":
                         if psn and not psn_written:
                             new_row.append(psn)
@@ -704,10 +774,10 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                         new_row.append("[ADDRESS]")
                         stats.add_entity("HOUSE")
                     elif cls == "VILLAGE":
-                        new_row.append("[VILLAGE]")
+                        new_row.append("[VILLAGE]" if suppress_village else cell)
                         stats.add_entity("VILLAGE")
                     elif cls == "PIN":
-                        new_row.append(generalize_pin(val, pin_prefix))
+                        new_row.append(generalize_pin(val, pin_prefix) if suppress_rare_pin else cell)
                         stats.add_entity("PIN")
                     elif cls == "AGE":
                         m_as = _AGE_SEX_CELL_RE.match(normalize_text(val))
@@ -722,7 +792,7 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                         new_row.append(shift_date_str(val, shift_days, month_first=month_first))
                         stats.records_generalized += 1
                     else:
-                        cleaned = redact_text(cell, gazetteer=gazetteer, stats=stats, pseudonym=psn)
+                        cleaned = redact_text(cell, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield)
                         cleaned = shift_date_str(cleaned, shift_days, month_first=month_first)
                         cleaned, n_res = scan_and_scrub_residual(cleaned, gazetteer=gazetteer)
                         if n_res:
@@ -744,18 +814,15 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
 
         elif item.fmt in ("json", "fhir") and item.parsed_json is not None:
             data = item.parsed_json
-            if is_clean_ref:
-                san_obj = data
-                for ru in units:
-                    records_out.append({"file": f"sanitized/{item.out_rel}", "loc": ru.loc, "patient": None})
-                    stats.records_processed += 1
-            elif len(units) == 1 and units[0].loc == "doc":
+            if len(units) == 1 and units[0].loc == "doc":
                 ru = units[0]
                 psn = ru.pseudonym
                 skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
                 shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, item.rel_path, max_shift))
                 san_obj = _sanitize_json_obj(
-                    data, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix
+                    data, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix,
+                    suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
+                    preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
                 )
                 records_out.append({
                     "file": f"sanitized/{item.out_rel}",
@@ -768,6 +835,8 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             else:
                 # Top-level dict with list-of-dict records
                 unit_by_loc = {u.loc: u for u in units}
+                meta_skey = f"unlinked|{item.rel_path}:meta"
+                meta_shift = safe_shifts.get(meta_skey, get_shift_for_record(keyring, None, f"{item.rel_path}:meta", max_shift))
                 san_obj = {}
                 for k, v in data.items():
                     if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
@@ -780,7 +849,9 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                             skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
                             shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, f"{item.rel_path}:{loc}", max_shift))
                             new_elem = _sanitize_json_obj(
-                                elem, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix
+                                elem, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix,
+                                suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
+                                preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
                             )
                             new_list.append(new_elem)
                             records_out.append({
@@ -793,38 +864,39 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                                 stats.records_linked += 1
                         san_obj[k] = new_list
                     else:
-                        san_obj[k] = _sanitize_json_obj(
-                            v, gazetteer, stats, None, get_shift_for_record(keyring, None, item.rel_path, max_shift),
+                        new_k = _sanitize_json_key(
+                            k, gazetteer, stats, None, meta_shift, use_clinical_shield=use_clinical_shield
+                        )
+                        san_obj[new_k] = _sanitize_json_obj(
+                            v, gazetteer, stats, None, meta_shift,
                             age_band_w, pin_prefix,
+                            suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
+                            preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
                         )
 
             out_json = json.dumps(san_obj, ensure_ascii=False, indent=2) + "\n"
-            if not is_clean_ref:
-                out_json, n_res = scan_and_scrub_residual(out_json, gazetteer=gazetteer)
-                if n_res:
-                    stats.add_entity("RESIDUAL", n_res)
+            out_json, n_res = scan_and_scrub_residual(out_json, gazetteer=gazetteer)
+            if n_res:
+                stats.add_entity("RESIDUAL", n_res)
             atomic_write_text(sanitized_dir / item.out_rel, out_json)
             stats.files_sanitized += 1
 
         else:
             ru = units[0]
             psn = ru.pseudonym
-            if is_clean_ref:
-                out_txt = item.text
-            else:
-                skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
-                shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, item.rel_path, max_shift))
-                out_txt = redact_text(item.text, gazetteer=gazetteer, stats=stats, pseudonym=psn)
-                out_txt = _AGE_INLINE_RE.sub(
-                    lambda m: f"{m.group(1)}{age_to_band(int(m.group(2)), age_band_w)}{m.group(3)}",
-                    out_txt,
-                )
-                out_txt = shift_date_str(out_txt, shift_days)
-                out_txt, n_res = scan_and_scrub_residual(out_txt, gazetteer=gazetteer)
-                if n_res:
-                    stats.add_entity("RESIDUAL", n_res)
-                if psn and psn not in out_txt:
-                    out_txt = f"Patient: {psn}\n" + out_txt
+            skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
+            shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, item.rel_path, max_shift))
+            out_txt = redact_text(item.text, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield)
+            out_txt = _AGE_INLINE_RE.sub(
+                lambda m: f"{m.group(1)}{age_to_band(int(m.group(2)), age_band_w)}{m.group(3)}",
+                out_txt,
+            )
+            out_txt = shift_date_str(out_txt, shift_days)
+            out_txt, n_res = scan_and_scrub_residual(out_txt, gazetteer=gazetteer)
+            if n_res:
+                stats.add_entity("RESIDUAL", n_res)
+            if psn and psn not in out_txt:
+                out_txt = f"Patient: {psn}\n" + out_txt
 
             atomic_write_text(sanitized_dir / item.out_rel, out_txt)
             records_out.append({

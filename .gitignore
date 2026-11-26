@@ -9,3 +9,13 @@ my_output/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx

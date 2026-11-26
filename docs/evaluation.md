@@ -6,6 +6,7 @@ Measured on the supplied truth-hash-matched Secret-Wards practice/development da
 
 | Metric | Starter Baseline | KAVACH-FHIR |
 |---|---:|---:|
+| Unit & Security Tests (`pytest`) | — | **78 passed, 1 xfailed** |
 | PII Leakage (`check_dev.py`) | 83.5%+ | **0 / 3,230** |
 | Canaries Leaked | 4 / 4 | **0 / 4** |
 | Clinical Preservation | 100.0% | **4,855 / 4,855** (100.0%) |
@@ -17,7 +18,7 @@ Measured on the supplied truth-hash-matched Secret-Wards practice/development da
 | Practice Dataset Files | 200 | **200** (193 sanitized, 7 quarantined) |
 | Exported Records | — | **822** |
 | Contract Validation | `CONTRACT OK` | **`CONTRACT OK`** |
-| Execution Time (CPU) | — | **~8.5–10.2s** |
+| Full Submission Checker | — | **`READY TO SUBMIT`** |
 
 ## Conservative Linkage Trade-Off
 

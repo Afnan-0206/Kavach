@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from engine.normalization import normalize_text
+from engine.normalization import map_norm_span, normalize_with_map
 from engine.record_model import EntitySpan
 
 # +91 72864 90658, +91-7286490658, 072864-90658, 7286490658
@@ -22,23 +22,31 @@ _LABELED_PHONE_RE = re.compile(
 
 def detect_phones(text: str) -> list[EntitySpan]:
     """Detect Indian phone numbers and masked phone numbers."""
-    norm = normalize_text(text)
-    target = norm if len(norm) == len(text) else text
+    target, idx_map = normalize_with_map(text)
+    if not target:
+        return []
     spans: list[EntitySpan] = []
 
+    def _add(ns: int, ne: int, val: str) -> None:
+        os_, oe_ = map_norm_span(idx_map, ns, ne)
+        if oe_ > os_:
+            spans.append(EntitySpan(os_, oe_, "PHONE", val))
+
     for m in _PHONE_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "PHONE", m.group(0)))
+        _add(m.start(), m.end(), m.group(0))
 
     for m in _LANDLINE_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "PHONE", m.group(0)))
+        _add(m.start(), m.end(), m.group(0))
 
     for m in _MASKED_PHONE_RE.finditer(target):
-        spans.append(EntitySpan(m.start(), m.end(), "PHONE", m.group(0)))
+        _add(m.start(), m.end(), m.group(0))
 
     for m in _LABELED_PHONE_RE.finditer(target):
         val = m.group(1).strip()
         digits = re.sub(r"\D", "", val)
         if 8 <= len(digits) <= 13:
-            spans.append(EntitySpan(m.start(1), m.start(1) + len(val), "PHONE", val))
+            lead = len(m.group(1)) - len(m.group(1).lstrip())
+            ns = m.start(1) + lead
+            _add(ns, ns + len(val), val)
 
     return spans

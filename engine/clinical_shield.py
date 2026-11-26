@@ -26,15 +26,15 @@ _EPONYM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Clinical complaint / history prefixes: C/O fever, K/C/O diabetes, H/O hypertension
-# Stop at sentence boundary ('. '), ';', ',', newline, or attendant/kinship clauses.
+# Clinical complaint / history prefixes: K/C/O, H/O, F/H/O, P/H/O
+# Protect the history marker itself so it is never misparsed as a kinship prefix (H/o, C/O),
+# while allowing PII (names, phones, IDs) following a clinical condition to be redacted.
 _CLINICAL_PREFIX_RE = re.compile(
-    r"\b(?:K/C/O|H/O|F/H/O|P/H/O)\s*[:\-]?\s*"
-    r"(?:(?!\.\s|\bAttendant\b|\((?:S/o|W/o|D/o|C/O)\b)[^\n,;]){2,60}",
+    r"\b(?:K/C/O|H/O|F/H/O|P/H/O)\b",
     re.IGNORECASE,
 )
 
-# C/O followed by clinical symptom words (NOT a person name)
+# C/O followed by clinical symptom words (NOT a person name) — protect only the C/O + symptom phrase
 _CLINICAL_COMPLAINTS = (
     "fever|bukhar|pain|dard|cough|khansi|cold|breathlessness|dyspnea|dyspnoea|"
     "vomiting|nausea|diarrhoea|diarrhea|loose\\s+motions|weakness|kamzori|fatigue|"
@@ -46,8 +46,7 @@ _CLINICAL_COMPLAINTS = (
     "बुखार|दर्द|खांसी|उल्टी|दस्त|कमजोरी|चक्कर|सूजन|सांस"
 )
 _CO_COMPLAINT_RE = re.compile(
-    rf"\bC/O\s*[:\-]?\s*(?:{_CLINICAL_COMPLAINTS})\b"
-    r"(?:(?!\.\s|\bAttendant\b|\((?:S/o|W/o|D/o|C/O)\b)[^\n,;])*",
+    rf"\bC/O\s*[:\-]?\s*(?:{_CLINICAL_COMPLAINTS})\b(?:\s+x\s+\d+\s*(?:days?|wks?|weeks?|months?|d|w|m))?",
     re.IGNORECASE,
 )
 
