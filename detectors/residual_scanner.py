@@ -18,19 +18,25 @@ def scan_and_scrub_residual(
     """Scan output text for any surviving direct IDs or known patient names and scrub them."""
     if not text:
         return text, 0
-    protected = find_protected_spans(text)
-    hits: list[EntitySpan] = []
+    has_id_char = any(c.isdigit() or c == "@" for c in text)
+    has_gaz = gazetteer is not None and gazetteer._compiled_full is not None
+    if not has_id_char and not has_gaz:
+        return text, 0
 
-    for s in detect_indian_ids(text):
-        if s.entity_type in ("AADHAAR", "ABHA_NUMBER", "ABHA_ADDRESS", "PAN", "EMAIL", "INSURANCE_ID", "AADHAAR_MASKED"):
+    hits: list[EntitySpan] = []
+    protected = find_protected_spans(text)
+
+    if has_id_char:
+        for s in detect_indian_ids(text):
+            if s.entity_type in ("AADHAAR", "ABHA_NUMBER", "ABHA_ADDRESS", "PAN", "EMAIL", "INSURANCE_ID", "AADHAAR_MASKED"):
+                if not overlaps_protected(s.start, s.end, protected):
+                    hits.append(s)
+
+        for s in detect_phones(text):
             if not overlaps_protected(s.start, s.end, protected):
                 hits.append(s)
 
-    for s in detect_phones(text):
-        if not overlaps_protected(s.start, s.end, protected):
-            hits.append(s)
-
-    if gazetteer is not None and gazetteer._compiled_full is not None:
+    if has_gaz:
         for m in gazetteer._compiled_full.finditer(text):
             if not overlaps_protected(m.start(), m.end(), protected):
                 hits.append(EntitySpan(m.start(), m.end(), "PATIENT_NAME", m.group(0)))

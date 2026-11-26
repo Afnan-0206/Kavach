@@ -4,15 +4,15 @@ from __future__ import annotations
 import re
 
 from engine.clinical_shield import overlaps_protected
-from engine.normalization import normalize_text
+from engine.normalization import _HOMOGLYPHS, _INDIC_DIGITS, normalize_text
 from engine.record_model import EntitySpan
 
 # Labeled names in English, Hinglish, and Hindi
 _LABELED_NAME_RE = re.compile(
-    r"(?i:(?:Patient(?:'s)?\s+Name|Pt\.?\s+Name|Full\s+Name|Name|Naam|नाम|मरीज़(?:\s+का\s+नाम)?|रोगी(?:\s+का\s+नाम)?|"
-    r"Witnessed\s+by|Raised\s+by|Attendant(?:\s+Name)?)\s*[:\-]\s*"
-    r"(?:Shri\s+|Smt\.?\s+|Mr\.?\s+|Mrs\.?\s+|Ms\.?\s+|श्री\s+|श्रीमती\s+)?)"
-    r"([A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+(?:\s+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+){0,3})"
+    r"(?i:(?:Patient(?:'s)?[ \t]+Name|Pt\.?[ \t]+Name|Full[ \t]+Name|Name|Naam|नाम|मरीज़(?:[ \t]+का[ \t]+नाम)?|रोगी(?:[ \t]+का[ \t]+नाम)?|"
+    r"Witnessed[ \t]+by|Raised[ \t]+by|Attendant(?:[ \t]+Name)?)[ \t]*[:\-][ \t]*"
+    r"(?:Shri[ \t]+|Smt\.?[ \t]+|Mr\.?[ \t]+|Mrs\.?[ \t]+|Ms\.?[ \t]+|श्री[ \t]+|श्रीमती[ \t]+)?)"
+    r"([A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+(?:[ \t]+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\.']+){0,3})"
 )
 
 # Honorific-anchored names: "Shahid sahab", "Asha ji", "मोहम्मद शाहिद जी", "श्री रामेश"
@@ -59,6 +59,8 @@ _STOP_WORDS = {
 def detect_contextual_names(text: str, protected: list[tuple[int, int, str]]) -> list[EntitySpan]:
     """Detect person names using labels, honorifics, roles, and Hindi/Hinglish syntactic cues."""
     spans: list[EntitySpan] = []
+    # 1-to-1 homoglyph & Indic-digit fold preserves exact character offsets in `text`
+    scan_text = text if text.isascii() else text.translate(_HOMOGLYPHS).translate(_INDIC_DIGITS)
 
     for rx in (
         _LABELED_NAME_RE,
@@ -71,7 +73,7 @@ def detect_contextual_names(text: str, protected: list[tuple[int, int, str]]) ->
         _ACTION_NAME_RE,
         _NAME_BEFORE_PHONE_RE,
     ):
-        for m in rx.finditer(text):
+        for m in rx.finditer(scan_text):
             start, end = m.start(1), m.end(1)
             if overlaps_protected(start, end, protected):
                 continue

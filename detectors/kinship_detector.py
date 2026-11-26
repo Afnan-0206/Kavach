@@ -8,10 +8,12 @@ from engine.record_model import EntitySpan
 
 # Latin kinship markers: prefix is case-insensitive, name MUST start with uppercase [A-Z]
 _LATIN_KINSHIP_RE = re.compile(
-    r"(?i:\b(?:S/o|D/o|W/o|C/O|M/o|F/o|H/o|Guardian|Relative(?:\s+Name)?|Father(?:'s)?(?:\s+Name)?|"
-    r"Husband(?:'s)?(?:\s+Name)?|Mother(?:'s)?(?:\s+Name)?|Pita/Pati\s+ka\s+Naam)\s*[:\-]?\s*"
-    r"(?:Late\s+|Shri\s+|Smt\.?\s+|Mr\.?\s+|Mrs\.?\s+)?)"
-    r"([A-Z][a-zA-Z\.']+(?:\s+[A-Z][a-zA-Z\.']+){0,3})"
+    r"(?i:\b(?:S/o|D/o|W/o|C/O|M/o|F/o|H/o|Guardian|Relative(?:[ \t]+Name)?|"
+    r"Attendant(?:[ \t]+Name)?|Attender|Next[ \t]+of[ \t]+Kin|Caregiver|Contact[ \t]+Person|"
+    r"Father(?:'s)?(?:[ \t]+Name)?|Husband(?:'s)?(?:[ \t]+Name)?|Mother(?:'s)?(?:[ \t]+Name)?|"
+    r"Wife(?:'s)?(?:[ \t]+Name)?|Pita/Pati[ \t]+ka[ \t]+Naam)[ \t]*[:\-]?[ \t]*"
+    r"(?:Late[ \t]+|Shri[ \t]+|Smt\.?[ \t]+|Mr\.?[ \t]+|Mrs\.?[ \t]+)?)"
+    r"([A-Z][a-zA-Z\.']+(?:[ \t]+[A-Z][a-zA-Z\.']+){0,3})"
 )
 
 # Devanagari kinship markers: पुत्र, पुत्री, पत्नी, पिता, माता, पति, अभिभावक

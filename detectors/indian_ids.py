@@ -16,11 +16,12 @@ _PAN_RE = re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b")
 
 # Hospital MRN / UHID / IPD / OPD / Sample / Bill / Insurance IDs
 # Covers: SNJ/26/064127, SNJ-26-064508, UHID-010607, JJH-0077132, ADM000162, DHH-IPD-00591,
-# IP-26-00130, OPD/26/02/00085, BL/26/000235, REG-..., MRN-..., PT-..., etc.
+# IP-26-00130, OPD/26/02/00085, BL/26/000235, and general unseen hospital prefix-year-seq IDs.
 _MRN_PREFIXED_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:UHID|MRN|IPD|OPD|ADM|SNJ|JJH|DHH|ARG|BL|REG|IP|SMP|LAB|PAT)"
     r"(?:[/\-]\d{2,4}){1,3}(?:[/\-][A-Z0-9]{2,10})?(?![A-Za-z0-9])"
-    r"|(?<![A-Za-z0-9])(?:UHID|MRN|IPD|ADM|SNJ|JJH|DHH|REG)[\-/]?\d{4,10}(?![A-Za-z0-9])",
+    r"|(?<![A-Za-z0-9])(?:UHID|MRN|IPD|ADM|SNJ|JJH|DHH|REG)[\-/]?\d{4,10}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9])[A-Z]{2,4}[/\-]\d{2,4}[/\-]\d{4,8}(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 

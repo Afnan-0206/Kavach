@@ -22,7 +22,8 @@ _WARD_LOCALITY_RE = re.compile(
 )
 
 _LANDMARK_RE = re.compile(
-    r"\b(?:near|opp\.?|opposite|behind|beside|in\s+front\s+of|के\s+पास|के\s+सामने)\s+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F0-9\s\-]{2,35}?(?=[,\n;]|$|\s+(?:Tehsil|Distt|District|Gram|Village|PIN))",
+    r"\b(?:near|opp\.?|opposite|behind|beside|in\s+front\s+of|के\s+पास|के\s+सामने)\s+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F0-9\s\-]{2,35}?(?=[,\n;]|$|\s+(?:Tehsil|Distt|District|Gram|Village|PIN))"
+    r"|([\u0900-\u097F0-9]{2,}(?:\s+[\u0900-\u097F0-9]{2,}){0,4}\s+(?:के\s+पास|के\s+सामने|के\s+पीछे))",
     re.IGNORECASE,
 )
 
