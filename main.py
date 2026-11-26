@@ -29,12 +29,17 @@ from engine.normalization import deva_to_latin, has_devanagari, latin_to_deva, n
 from engine.pii_detector import classify_field_name, detect_all_spans, redact_text
 from engine.privacy_engine import (
     age_to_band,
+    broaden_rare_diagnosis,
     choose_collision_safe_shift,
+    extract_candidate_clinical_terms,
     extract_dates_in_text,
+    generalize_hospital_name,
     generalize_pin,
     get_shift_for_record,
+    jitter_los_dates,
     parse_date_flexible,
     shift_date_str,
+    widen_age_band_20yr,
 )
 from engine.record_model import IngestedFile, PipelineStats, RecordUnit
 from engine.reporting import write_report
@@ -49,6 +54,23 @@ _AGE_SEX_CELL_RE = re.compile(
     re.IGNORECASE,
 )
 _B64_RE = re.compile(r"^[A-Za-z0-9+/]{24,}={0,2}$")
+_TEHSIL_INLINE_RE = re.compile(
+    r"\b(?:Tehsil|Taluka|तहसील)\s+[A-Z\u0900-\u097F][A-Za-z\u0900-\u097F\s\-]{1,25}?(?=[,\n;]|$|\s+(?:Distt|District|PIN|State|जिला))",
+    re.IGNORECASE,
+)
+_DISTRICT_INLINE_RE = re.compile(
+    r"(?i)((?<![A-Za-z\u0900-\u097F])(?:District|Distt?\.?|Jila|जिला)[ \t]*[:\-][ \t]*)"
+    r"([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F \t]{1,30}?)"
+    r"(?=[,\r\n;]|$|[ \t]+(?:Age|Gender|Sex|DOB|Date|Hospital|PIN|Tehsil|State|Phone|Mobile|Aadhaar|ABHA|MRN|UHID|Village|Gram|आयु|उम्र|लिंग|पिन|तहसील|राज्य|जन्म)(?![A-Za-z\u0900-\u097F]))"
+)
+
+
+def _suppress_tehsil_inline(text: str) -> str:
+    return _TEHSIL_INLINE_RE.sub("[TEHSIL]", text) if text else text
+
+
+def _generalize_district_inline(text: str) -> str:
+    return _DISTRICT_INLINE_RE.sub(r"\1[REGION]", text) if text else text
 
 
 def load_policy(path: Path) -> dict:
@@ -111,7 +133,7 @@ def _extract_clues_from_text(text: str, clues: dict[str, Any], gazetteer: Dynami
         m_dist = re.search(
             r"(?i)(?<![A-Za-z\u0900-\u097F])(?:District|Distt?\.?|Jila|जिला)[ \t]*[:\-][ \t]*"
             r"([A-Za-z\u0900-\u097F][A-Za-z\u0900-\u097F \t]{1,30}?)"
-            r"(?=[,\n;]|$|[ \t]+(?:Age|Gender|Sex|DOB|Date|Hospital|PIN|Tehsil|State|Phone|Mobile|Aadhaar|ABHA|MRN|UHID|Village|Gram|आयु|उम्र|लिंग|पिन|तहसील|राज्य|जन्म)(?![A-Za-z\u0900-\u097F]))",
+            r"(?=[,\r\n;]|$|[ \t]+(?:Age|Gender|Sex|DOB|Date|Hospital|PIN|Tehsil|State|Phone|Mobile|Aadhaar|ABHA|MRN|UHID|Village|Gram|आयु|उम्र|लिंग|पिन|तहसील|राज्य|जन्म)(?![A-Za-z\u0900-\u097F]))",
             text,
         )
         if m_dist:
@@ -391,6 +413,13 @@ def _sanitize_json_obj(
     suppress_village: bool = True,
     preserve_clinician_names: bool = True,
     use_clinical_shield: bool = True,
+    widen_age: bool = False,
+    generalize_district: bool = False,
+    broaden_diagnosis: bool = False,
+    rare_terms: set[str] | None = None,
+    suppress_tehsil: bool = False,
+    generalize_hospital: bool = False,
+    los_jitter: tuple[KeyRing, str] | None = None,
 ) -> Any:
     if isinstance(obj, dict):
         rt = obj.get("resourceType")
@@ -476,22 +505,23 @@ def _sanitize_json_obj(
                     new_dict[new_k] = "[ADDRESS]"
                     stats.add_entity("HOUSE")
                 elif cls == "AGE":
+                    band_fn = widen_age_band_20yr if widen_age else (lambda a: age_to_band(a, age_band_w))
                     if isinstance(v, int):
-                        new_dict[new_k] = age_to_band(v, age_band_w)
+                        new_dict[new_k] = band_fn(v)
                         stats.records_generalized += 1
                     elif isinstance(v, str):
                         nv = normalize_text(sv)
                         m_as = _AGE_SEX_CELL_RE.match(nv)
                         if m_as:
-                            new_dict[new_k] = f"{age_to_band(int(m_as.group(1)), age_band_w)}{m_as.group(2)}"
+                            new_dict[new_k] = f"{band_fn(int(m_as.group(1)))}{m_as.group(2)}"
                             stats.records_generalized += 1
                         elif nv.isdigit():
-                            new_dict[new_k] = age_to_band(int(nv), age_band_w)
+                            new_dict[new_k] = band_fn(int(nv))
                             stats.records_generalized += 1
                         else:
                             new_dict[new_k] = _AGE_INLINE_RE.sub(
-                                lambda m: f"{m.group(1)}{age_to_band(int(m.group(2)), age_band_w)}{m.group(3)}",
-                                redact_text(sv, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield),
+                                lambda m: f"{m.group(1)}{band_fn(int(m.group(2)))}{m.group(3)}",
+                                redact_text(sv, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield, pin_prefix=pin_prefix),
                             )
                 elif cls in ("DOB", "DATE") or k in ("birthDate", "recordedDate", "authoredOn", "effectiveDateTime", "performedDateTime", "timestamp", "date", "start", "end"):
                     if isinstance(v, str):
@@ -500,7 +530,11 @@ def _sanitize_json_obj(
                         new_dict[new_k] = v
                 elif cls == "CLINICIAN":
                     new_dict[new_k] = v if preserve_clinician_names else "[CLINICIAN]"
-                elif cls in ("DISTRICT", "GENDER"):
+                elif cls == "DISTRICT":
+                    new_dict[new_k] = "[REGION]" if generalize_district else v
+                elif cls == "TEHSIL":
+                    new_dict[new_k] = "[TEHSIL]" if suppress_tehsil else v
+                elif cls == "GENDER":
                     new_dict[new_k] = v
                 elif k.lower() == "ward" and isinstance(v, str):
                     has_res_sibling = any(
@@ -525,8 +559,17 @@ def _sanitize_json_obj(
                                 continue
                         except (binascii.Error, UnicodeDecodeError, ValueError):
                             pass
-                    cleaned = redact_text(v, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
-                    cleaned = shift_date_str(cleaned, shift_days)
+                    cleaned = redact_text(v, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield, pin_prefix=pin_prefix)
+                    if broaden_diagnosis:
+                        cleaned = broaden_rare_diagnosis(cleaned, rare_terms=rare_terms)
+                    if generalize_hospital:
+                        cleaned = generalize_hospital_name(cleaned)
+                    if suppress_tehsil:
+                        cleaned = _suppress_tehsil_inline(cleaned)
+                    if los_jitter is not None:
+                        cleaned = jitter_los_dates(cleaned, los_jitter[0], los_jitter[1], shift_days)
+                    else:
+                        cleaned = shift_date_str(cleaned, shift_days)
                     new_dict[new_k] = cleaned
                 else:
                     new_dict[new_k] = v
@@ -536,6 +579,9 @@ def _sanitize_json_obj(
                     in_fhir_practitioner_or_org=is_clinical_actor, parent_key=k,
                     suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
                     preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
+                    widen_age=widen_age, generalize_district=generalize_district, broaden_diagnosis=broaden_diagnosis,
+                    rare_terms=rare_terms, suppress_tehsil=suppress_tehsil,
+                    generalize_hospital=generalize_hospital, los_jitter=los_jitter,
                 )
         return new_dict
     elif isinstance(obj, list):
@@ -545,11 +591,22 @@ def _sanitize_json_obj(
                 in_fhir_practitioner_or_org=in_fhir_practitioner_or_org, parent_key=parent_key,
                 suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
                 preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
+                widen_age=widen_age, generalize_district=generalize_district, broaden_diagnosis=broaden_diagnosis,
+                rare_terms=rare_terms, suppress_tehsil=suppress_tehsil,
+                generalize_hospital=generalize_hospital, los_jitter=los_jitter,
             )
             for x in obj
         ]
     elif isinstance(obj, str):
-        cleaned = redact_text(obj, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield)
+        cleaned = redact_text(obj, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym, use_clinical_shield=use_clinical_shield, pin_prefix=pin_prefix)
+        if broaden_diagnosis:
+            cleaned = broaden_rare_diagnosis(cleaned, rare_terms=rare_terms)
+        if generalize_hospital:
+            cleaned = generalize_hospital_name(cleaned)
+        if suppress_tehsil:
+            cleaned = _suppress_tehsil_inline(cleaned)
+        if los_jitter is not None:
+            return jitter_los_dates(cleaned, los_jitter[0], los_jitter[1], shift_days)
         return shift_date_str(cleaned, shift_days)
     return obj
 
@@ -567,6 +624,17 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
     use_clinical_shield = bool(policy.get("preserve_clinical_values", True))
     linkage_auto_merge_threshold = float(policy.get("linkage_auto_merge_threshold", 0.88))
     linkage_min_independent_clues = int(policy.get("linkage_min_independent_clues", 2))
+    min_group_size = int(policy.get("min_group_size", 5))
+    qi_enabled = bool(policy.get("qi_generalization_enabled", True))
+    qi_widen_pin = bool(policy.get("qi_widen_pin", True))
+    qi_suppress_k1_pin = bool(policy.get("qi_suppress_k1_pin", True))
+    qi_widen_age_band = bool(policy.get("qi_widen_age_band", True))
+    qi_suppress_small_tehsil = bool(policy.get("qi_suppress_small_tehsil", True))
+    qi_jitter_high_risk_los = bool(policy.get("qi_jitter_high_risk_los", True))
+    qi_gen_district = bool(policy.get("qi_generalize_rare_district", False))
+    qi_gen_hospital = bool(policy.get("qi_generalize_rare_hospital", False))
+    qi_gen_diag = bool(policy.get("qi_generalize_rare_diagnosis", False))
+    qi_rare_max_profiles = int(policy.get("qi_rare_condition_max_profiles", 3))
 
     sanitized_dir = output_dir / "sanitized"
     sanitized_dir.mkdir(parents=True, exist_ok=True)
@@ -698,6 +766,52 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
         min_independent_clues=linkage_min_independent_clues,
     )
 
+    # Risk-aware equivalence-class sizing across distinct patients/unlinked units
+    ec_counts: dict[tuple[str, str, str], int] = {}
+    unit_qi_key: dict[int, tuple[str, str, str]] = {}
+    cluster_qi: dict[str, tuple[str, str, str]] = {}
+    for ru in all_units:
+        c = ru.clues
+        if c.get("age") is None and not c.get("district"):
+            continue
+        ab = age_to_band(int(c["age"]), age_band_w) if c.get("age") is not None else ""
+        gk = c.get("gender", "")
+        dk = normalize_text(c.get("district", "")).strip().lower()
+        qkey = (ab, gk, dk)
+        unit_qi_key[id(ru)] = qkey
+        pid_key = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
+        if pid_key not in cluster_qi:
+            cluster_qi[pid_key] = qkey
+            ec_counts[qkey] = ec_counts.get(qkey, 0) + 1
+    small_ec_units: set[int] = set()
+    k1_units: set[int] = set()
+    if qi_enabled:
+        for ru in all_units:
+            pid_key = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
+            qkey = cluster_qi.get(pid_key) or unit_qi_key.get(id(ru))
+            if qkey is None:
+                continue
+            cnt = ec_counts.get(qkey, 0)
+            if cnt < min_group_size:
+                small_ec_units.add(id(ru))
+            if cnt == 1:
+                k1_units.add(id(ru))
+
+    # Dataset-wide rare clinical terms (occurring in <= qi_rare_condition_max_profiles distinct profiles)
+    rare_terms: set[str] | None = None
+    if qi_gen_diag:
+        term_profiles: dict[str, set[str]] = {}
+        for ru in all_units:
+            pid_key = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
+            txt_src = ru.raw_text
+            if not txt_src:
+                item_obj = next((x for x in ingested if x.rel_path == ru.file_rel), None)
+                if item_obj and item_obj.parsed_json is not None:
+                    txt_src = json.dumps(item_obj.parsed_json, ensure_ascii=False)
+            for term in extract_candidate_clinical_terms(txt_src):
+                term_profiles.setdefault(term, set()).add(pid_key)
+        rare_terms = {t for t, profs in term_profiles.items() if len(profs) <= qi_rare_max_profiles}
+
     # Resolve collision-safe patient-level date shifts across the entire dataset
     dates_by_shift_key: dict[str, set[dt.date]] = dict(top_json_meta_dates)
     for ru in all_units:
@@ -735,6 +849,19 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             for idx, row in enumerate(body):
                 ru = units[idx]
                 psn = ru.pseudonym
+                is_small_ec = id(ru) in small_ec_units
+                is_k1 = id(ru) in k1_units
+                eff_pin_prefix = (
+                    0 if (is_k1 and qi_suppress_k1_pin)
+                    else (max(1, pin_prefix - 1) if (is_small_ec and qi_widen_pin) else pin_prefix)
+                )
+                eff_widen_age = is_small_ec and qi_widen_age_band
+                eff_gen_dist = is_small_ec and qi_gen_district
+                eff_suppress_tehsil = is_small_ec and qi_suppress_small_tehsil
+                eff_gen_hosp = is_small_ec and qi_gen_hospital
+                eff_broaden_diag = is_small_ec and qi_gen_diag
+                eff_jitter_los = is_small_ec and qi_jitter_high_risk_los
+                band_fn = widen_age_band_20yr if eff_widen_age else (lambda a: age_to_band(a, age_band_w))
                 skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
                 shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, f"{item.rel_path}:{idx}", max_shift))
                 new_row: list[str] = []
@@ -746,8 +873,12 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                     if not val:
                         new_row.append(cell)
                         continue
-                    if cls in ("DISTRICT", "TEHSIL", "GENDER"):
+                    if cls == "GENDER":
                         new_row.append(cell)
+                    elif cls == "TEHSIL":
+                        new_row.append("[TEHSIL]" if eff_suppress_tehsil else cell)
+                    elif cls == "DISTRICT":
+                        new_row.append("[REGION]" if eff_gen_dist else cell)
                     elif cls == "CLINICIAN":
                         new_row.append(cell if preserve_clinician_names else "[CLINICIAN]")
                     elif cls == "MRN":
@@ -777,14 +908,14 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                         new_row.append("[VILLAGE]" if suppress_village else cell)
                         stats.add_entity("VILLAGE")
                     elif cls == "PIN":
-                        new_row.append(generalize_pin(val, pin_prefix) if suppress_rare_pin else cell)
+                        new_row.append(generalize_pin(val, eff_pin_prefix) if suppress_rare_pin else cell)
                         stats.add_entity("PIN")
                     elif cls == "AGE":
                         m_as = _AGE_SEX_CELL_RE.match(normalize_text(val))
                         if m_as:
-                            new_row.append(f"{age_to_band(int(m_as.group(1)), age_band_w)}{m_as.group(2)}")
+                            new_row.append(f"{band_fn(int(m_as.group(1)))}{m_as.group(2)}")
                         elif normalize_text(val).isdigit():
-                            new_row.append(age_to_band(int(normalize_text(val)), age_band_w))
+                            new_row.append(band_fn(int(normalize_text(val))))
                         else:
                             new_row.append(val)
                         stats.records_generalized += 1
@@ -792,8 +923,17 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                         new_row.append(shift_date_str(val, shift_days, month_first=month_first))
                         stats.records_generalized += 1
                     else:
-                        cleaned = redact_text(cell, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield)
-                        cleaned = shift_date_str(cleaned, shift_days, month_first=month_first)
+                        cleaned = redact_text(cell, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield, pin_prefix=eff_pin_prefix)
+                        if eff_broaden_diag:
+                            cleaned = broaden_rare_diagnosis(cleaned, rare_terms=rare_terms)
+                        if eff_gen_hosp:
+                            cleaned = generalize_hospital_name(cleaned)
+                        if eff_suppress_tehsil:
+                            cleaned = _suppress_tehsil_inline(cleaned)
+                        if eff_jitter_los:
+                            cleaned = jitter_los_dates(cleaned, keyring, skey, shift_days, month_first=month_first)
+                        else:
+                            cleaned = shift_date_str(cleaned, shift_days, month_first=month_first)
                         cleaned, n_res = scan_and_scrub_residual(cleaned, gazetteer=gazetteer)
                         if n_res:
                             stats.add_entity("RESIDUAL", n_res)
@@ -817,12 +957,25 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
             if len(units) == 1 and units[0].loc == "doc":
                 ru = units[0]
                 psn = ru.pseudonym
+                is_small_ec = id(ru) in small_ec_units
+                is_k1 = id(ru) in k1_units
+                eff_pin_prefix = (
+                    0 if (is_k1 and qi_suppress_k1_pin)
+                    else (max(1, pin_prefix - 1) if (is_small_ec and qi_widen_pin) else pin_prefix)
+                )
                 skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
                 shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, item.rel_path, max_shift))
                 san_obj = _sanitize_json_obj(
-                    data, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix,
+                    data, gazetteer, stats, psn, shift_days, age_band_w, eff_pin_prefix,
                     suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
                     preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
+                    widen_age=(is_small_ec and qi_widen_age_band),
+                    generalize_district=(is_small_ec and qi_gen_district),
+                    broaden_diagnosis=(is_small_ec and qi_gen_diag),
+                    rare_terms=rare_terms,
+                    suppress_tehsil=(is_small_ec and qi_suppress_small_tehsil),
+                    generalize_hospital=(is_small_ec and qi_gen_hospital),
+                    los_jitter=(keyring, skey) if (is_small_ec and qi_jitter_high_risk_los) else None,
                 )
                 records_out.append({
                     "file": f"sanitized/{item.out_rel}",
@@ -846,12 +999,25 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
                             loc = f"/{ptr_k}/{idx}"
                             ru = unit_by_loc[loc]
                             psn = ru.pseudonym
+                            is_small_ec = id(ru) in small_ec_units
+                            is_k1 = id(ru) in k1_units
+                            eff_pin_prefix = (
+                                0 if (is_k1 and qi_suppress_k1_pin)
+                                else (max(1, pin_prefix - 1) if (is_small_ec and qi_widen_pin) else pin_prefix)
+                            )
                             skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
                             shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, f"{item.rel_path}:{loc}", max_shift))
                             new_elem = _sanitize_json_obj(
-                                elem, gazetteer, stats, psn, shift_days, age_band_w, pin_prefix,
+                                elem, gazetteer, stats, psn, shift_days, age_band_w, eff_pin_prefix,
                                 suppress_rare_pin=suppress_rare_pin, suppress_village=suppress_village,
                                 preserve_clinician_names=preserve_clinician_names, use_clinical_shield=use_clinical_shield,
+                                widen_age=(is_small_ec and qi_widen_age_band),
+                                generalize_district=(is_small_ec and qi_gen_district),
+                                broaden_diagnosis=(is_small_ec and qi_gen_diag),
+                                rare_terms=rare_terms,
+                                suppress_tehsil=(is_small_ec and qi_suppress_small_tehsil),
+                                generalize_hospital=(is_small_ec and qi_gen_hospital),
+                                los_jitter=(keyring, skey) if (is_small_ec and qi_jitter_high_risk_los) else None,
                             )
                             new_list.append(new_elem)
                             records_out.append({
@@ -884,14 +1050,32 @@ def run_pipeline(input_dir: Path, output_dir: Path, policy_path: Path) -> int:
         else:
             ru = units[0]
             psn = ru.pseudonym
+            is_small_ec = id(ru) in small_ec_units
+            is_k1 = id(ru) in k1_units
+            eff_pin_prefix = (
+                0 if (is_k1 and qi_suppress_k1_pin)
+                else (max(1, pin_prefix - 1) if (is_small_ec and qi_widen_pin) else pin_prefix)
+            )
+            band_fn = widen_age_band_20yr if (is_small_ec and qi_widen_age_band) else (lambda a: age_to_band(a, age_band_w))
             skey = ru.patient_key if ru.patient_key else f"unlinked|{ru.file_rel}:{ru.loc}"
             shift_days = safe_shifts.get(skey, get_shift_for_record(keyring, ru.patient_key, item.rel_path, max_shift))
-            out_txt = redact_text(item.text, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield)
+            out_txt = redact_text(item.text, gazetteer=gazetteer, stats=stats, pseudonym=psn, use_clinical_shield=use_clinical_shield, pin_prefix=eff_pin_prefix)
+            if is_small_ec and qi_gen_diag:
+                out_txt = broaden_rare_diagnosis(out_txt, rare_terms=rare_terms)
+            if is_small_ec and qi_gen_hospital:
+                out_txt = generalize_hospital_name(out_txt)
+            if is_small_ec and qi_gen_district:
+                out_txt = _generalize_district_inline(out_txt)
+            if is_small_ec and qi_suppress_small_tehsil:
+                out_txt = _suppress_tehsil_inline(out_txt)
             out_txt = _AGE_INLINE_RE.sub(
-                lambda m: f"{m.group(1)}{age_to_band(int(m.group(2)), age_band_w)}{m.group(3)}",
+                lambda m: f"{m.group(1)}{band_fn(int(m.group(2)))}{m.group(3)}",
                 out_txt,
             )
-            out_txt = shift_date_str(out_txt, shift_days)
+            if is_small_ec and qi_jitter_high_risk_los:
+                out_txt = jitter_los_dates(out_txt, keyring, skey, shift_days)
+            else:
+                out_txt = shift_date_str(out_txt, shift_days)
             out_txt, n_res = scan_and_scrub_residual(out_txt, gazetteer=gazetteer)
             if n_res:
                 stats.add_entity("RESIDUAL", n_res)

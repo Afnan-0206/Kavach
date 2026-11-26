@@ -45,13 +45,15 @@ class KeyRing:
         return cls(raw)
 
     def pseudonym(self, canonical_patient_key: str, collision_salt: int = 0) -> str:
-        """Generate a deterministic, non-reversible PSN-XXXXXX pseudonym."""
+        """Generate a deterministic, non-reversible 80-bit PSN-XXXXXXXXXXXXXXXX pseudonym."""
+        if collision_salt > 1000:
+            raise RuntimeError("Pseudonym collision resolution exceeded safe retry bound")
         msg = canonical_patient_key.encode("utf-8")
         if collision_salt:
             msg += f"|{collision_salt}".encode("utf-8")
         digest = hmac.new(self._pseudonym_key, msg, hashlib.sha256).digest()
-        n = int.from_bytes(digest[:5], "big")
-        code = "".join(_CROCKFORD_B32[(n >> (5 * i)) & 31] for i in range(6))
+        n = int.from_bytes(digest[:10], "big")  # 80 bits (16 x 5-bit Crockford Base32 chars)
+        code = "".join(_CROCKFORD_B32[(n >> (5 * i)) & 31] for i in range(15, -1, -1))
         return f"PSN-{code}"
 
     def date_shift_days(self, canonical_key: str, max_days: int = 180, attempt: int = 0) -> int:

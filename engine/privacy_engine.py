@@ -90,8 +90,123 @@ def age_to_band(age: int, band_width: int = 5) -> str:
     return f"{lo}-{lo + band_width - 1}"
 
 
+def widen_age_band_20yr(age: int) -> str:
+    """Coarsen an integer age into a 20-year bucket (80+ top-coded) for small equivalence classes."""
+    if age < 0:
+        return "0-19"
+    if age >= 80:
+        return "80+"
+    lo = (age // 20) * 20
+    return f"{lo}-{lo + 19}"
+
+
+_DIAGNOSIS_BROAD_CATEGORIES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\b(?:dengue|malaria|typhoid|tuberculosis|tb|leptospirosis|chikungunya|hepatitis|kala[\s\-]?azar|scrub\s+typhus)\b|डेंगू|मलेरिया|टाइफाइड|टीबी|तपेदिक|चिकनगुनिया|हेपेटाइटिस", re.I), "Infectious Disease"),
+    (re.compile(r"\b(?:parkinson(?:'s)?|alzheimer(?:'s)?|epilepsy|seizure|stroke|guillain[\s\-]?barr[eé]|huntington(?:'s)?|neuropathy|craniotomy|meningitis)\b|मिर्गी|लकवा|पार्किंसन", re.I), "Neurological Condition"),
+    (re.compile(r"\b(?:hypertension|cad|coronary|angina|myocardial|arrhythmia|heart\s+failure|brugada|angioplasty|cabg|pacemaker)\b|एंजियोप्लास्टी|बाईपास", re.I), "Cardiovascular Condition"),
+    (re.compile(r"\b(?:asthma|copd|pneumonia|bronchitis|effusion|respiratory|bronchoscopy|thoracentesis)\b|दमा|निमोनिया", re.I), "Respiratory Condition"),
+    (re.compile(r"\b(?:diabetes|thyroid|hypothyroid|addison(?:'s)?|cushing(?:'s)?|graves|hashimoto(?:'s)?)\b|मधुमेह|थायराइड", re.I), "Endocrine/Metabolic Condition"),
+    (re.compile(r"\b(?:dialysis|hemodialysis|nephrectomy|ckd|renal\s+failure|glomerulonephritis)\b|डायलिसिस|गुर्दे", re.I), "Renal Condition"),
+    (re.compile(r"\b(?:appendectomy|cholecystectomy|laparotomy|hernioplasty|endoscopy|colonoscopy)\b", re.I), "Surgical Procedure"),
+)
+
+_HOSPITAL_FACILITY_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z]+\s+){1,4}"
+    r"(Multispeciality\s+Hospital|Charitable\s+Hospital|District\s+Hospital|Nursing\s+Home|Medical\s+Centre|Seva\s+Sadan|Hospital|Clinic|Diagnostics)\b"
+)
+
+
+def broaden_rare_diagnosis(text: str, rare_terms: set[str] | None = None) -> str:
+    """Map rare named conditions/procedures (English/Hindi/Hinglish) to broader clinical categories."""
+    out = text
+    for rx, cat in _DIAGNOSIS_BROAD_CATEGORIES:
+        if rare_terms is None:
+            out = rx.sub(cat, out)
+        else:
+            def _repl(m: re.Match, _cat: str = cat) -> str:
+                return _cat if m.group(0).strip().lower() in rare_terms else m.group(0)
+            out = rx.sub(_repl, out)
+    return out
+
+
+def extract_candidate_clinical_terms(text: str) -> set[str]:
+    """Extract matched clinical condition/procedure terms (lowercased) for <=3-profile frequency analysis."""
+    found: set[str] = set()
+    if not text:
+        return found
+    for rx, _ in _DIAGNOSIS_BROAD_CATEGORIES:
+        for m in rx.finditer(text):
+            found.add(m.group(0).strip().lower())
+    return found
+
+
+def generalize_hospital_name(text: str) -> str:
+    """Generalize specific hospital names to their facility category."""
+    if not text:
+        return text
+    def _repl(m: re.Match) -> str:
+        kind = m.group(1).strip()
+        return "Charitable Clinic" if kind.lower() == "seva sadan" else kind
+    return _HOSPITAL_FACILITY_RE.sub(_repl, text)
+
+
+def jitter_los_dates(
+    text: str,
+    keyring: KeyRing,
+    shift_key: str,
+    base_shift: int,
+    month_first: bool = False,
+) -> str:
+    """Shift dates per patient while adding a deterministic 1-3 day secondary-date jitter to obscure exact LOS."""
+    if not text:
+        return text
+    dates = sorted(extract_dates_in_text(text, month_first=month_first))
+    if len(dates) < 2:
+        return shift_date_str(text, base_shift, month_first=month_first)
+    earliest = dates[0]
+    # Deterministic non-zero jitter in {1, 2, 3} derived from keyring so chronological order (earliest < later) holds
+    raw_j = abs(keyring.date_shift_days(f"{shift_key}|los", max_days=3, attempt=0))
+    jitter = (raw_j % 3) + 1
+
+    def _shift_for(d: dt.date) -> int:
+        return base_shift if d == earliest else base_shift + jitter
+
+    def _repl_iso(m: re.Match) -> str:
+        try:
+            d = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return (d + dt.timedelta(days=_shift_for(d))).strftime("%Y-%m-%d")
+        except ValueError:
+            return m.group(0)
+
+    def _repl_dmy(m: re.Match) -> str:
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        sep = "/" if "/" in m.group(0) else "-"
+        try:
+            if month_first and a <= 12:
+                d = dt.date(y, a, b)
+                nd = d + dt.timedelta(days=_shift_for(d))
+                return f"{nd.month:02d}{sep}{nd.day:02d}{sep}{nd.year:04d}"
+            elif b <= 12:
+                d = dt.date(y, b, a)
+                nd = d + dt.timedelta(days=_shift_for(d))
+                return f"{nd.day:02d}{sep}{nd.month:02d}{sep}{nd.year:04d}"
+            elif a <= 12:
+                d = dt.date(y, a, b)
+                nd = d + dt.timedelta(days=_shift_for(d))
+                return f"{nd.month:02d}{sep}{nd.day:02d}{sep}{nd.year:04d}"
+        except ValueError:
+            pass
+        return m.group(0)
+
+    out = _ISO_DATE_RE.sub(_repl_iso, text)
+    out = _DMY_DATE_RE.sub(_repl_dmy, out)
+    return out
+
+
 def generalize_pin(pin: str, prefix_digits: int = 3) -> str:
-    """Generalize a 6-digit Indian PIN code to its 3-digit prefix (e.g., 229***)."""
+    """Generalize a 6-digit Indian PIN code to its prefix (or [PIN] when prefix_digits <= 0)."""
+    if prefix_digits <= 0:
+        return "[PIN]"
     digits = re.sub(r"\D", "", normalize_text(pin))
     if len(digits) == 6:
         return digits[:prefix_digits] + "*" * (6 - prefix_digits)

@@ -1,7 +1,18 @@
 # KAVACH-FHIR Privacy Policy Configuration
 age_band_years: 5
 date_shift_max_days: 180
-# Note: adaptive k-anonymity suppression (min_group_size) is intentionally disabled; see docs/k_anonymity_experiment.md
+min_group_size: 5
+qi_generalization_enabled: true
+qi_widen_pin: true
+qi_suppress_k1_pin: true
+qi_widen_age_band: true
+qi_suppress_small_tehsil: true
+qi_jitter_high_risk_los: true
+# Selected production A5/A3 policy (see experiments/results/policy_ablation_report.md)
+qi_generalize_rare_district: true
+qi_generalize_rare_hospital: true
+qi_generalize_rare_diagnosis: false
+qi_rare_condition_max_profiles: 3
 pin_prefix_digits: 3
 suppress_rare_pin: true
 suppress_village: true

@@ -254,7 +254,8 @@ def test_hindi_shri_honorific_and_age_gender_cells(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
     out = tmp_path / "out"
-    policy = Path(__file__).resolve().parents[1] / "config" / "policy.yaml"
+    policy = tmp_path / "policy_5yr.yaml"
+    policy.write_text("age_band_years: 5\nqi_widen_age_band: false\n", encoding="utf-8")
     monkeypatch.setenv("RAKSHA_SECRET", "hindi-age-sec")
     run_pipeline(inp, out, policy)
     san_csv = (out / "sanitized" / "hindi_ages.csv").read_text(encoding="utf-8")

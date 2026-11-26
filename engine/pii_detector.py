@@ -143,6 +143,7 @@ def redact_text(
     stats: PipelineStats | None = None,
     pseudonym: str | None = None,
     use_clinical_shield: bool = True,
+    pin_prefix: int = 3,
 ) -> str:
     """Detect and replace PII spans in text, plus sanitize embedded base64 payloads."""
     if not text:
@@ -160,7 +161,7 @@ def redact_text(
             return tok
         cleaned_inner = redact_text(
             decoded, gazetteer=gazetteer, stats=stats, pseudonym=pseudonym,
-            use_clinical_shield=use_clinical_shield,
+            use_clinical_shield=use_clinical_shield, pin_prefix=pin_prefix,
         )
         return base64.b64encode(cleaned_inner.encode("utf-8")).decode("ascii")
 
@@ -175,7 +176,7 @@ def redact_text(
     for sp in spans:
         out_parts.append(text[cursor:sp.start])
         if sp.entity_type == "PIN" and len(sp.text) == 6 and sp.text.isdigit():
-            replacement = f"{sp.text[:3]}***"
+            replacement = "[PIN]" if pin_prefix <= 0 else f"{sp.text[:pin_prefix]}{'*' * (6 - pin_prefix)}"
         elif sp.entity_type == "PATIENT_NAME" and pseudonym:
             replacement = pseudonym
         else:

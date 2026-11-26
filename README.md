@@ -79,7 +79,7 @@ flowchart TD
 
 - **Blocking & Corroboration:** Blocks on verified IDs (`AADHAAR`, `ABHA`, `PAN`, `EMAIL`, `MRN`, `INSURANCE_ID`), shared phones, and phonetic name tokens. Shared phone numbers never merge records alone; they require name, relative, or DOB corroboration.
 - **Cluster-Wide `cannot-link` Guards:** Rejects merges on conflicting gender, age delta `> 3`, differing DOB, conflicting government IDs, facility-specific MRN conflicts (while allowing verified government IDs to override generic `UHID`/`MRN`/`PAT`/`REG` prefixes), differing districts, or low full-name similarity.
-- **Keyed Pseudonyms (`engine/security.py`):** Derives domain-separated 256-bit keys from `RAKSHA_SECRET` using **HKDF-SHA256** (`kavach-fhir:pseudonym:v1`, `kavach-fhir:date-shift:v1`, `kavach-fhir:filename:v1`, `kavach-fhir:temp-aesgcm:v1`) and generates collision-checked Crockford Base32 `PSN-XXXXXX` pseudonyms via **HMAC-SHA256**.
+- **Keyed Pseudonyms (`engine/security.py`):** Derives domain-separated 256-bit keys from `RAKSHA_SECRET` using **HKDF-SHA256** (`kavach-fhir:pseudonym:v1`, `kavach-fhir:date-shift:v1`, `kavach-fhir:filename:v1`, `kavach-fhir:temp-aesgcm:v1`) and generates collision-checked 80-bit Crockford Base32 `PSN-XXXXXXXXXXXXXXXX` pseudonyms via **HMAC-SHA256**.
 
 ## 7. Privacy and Security Design
 
@@ -156,10 +156,10 @@ Measured on the supplied Secret-Wards practice dataset (`dev/input`: `200` files
 
 | Metric | Practice Result |
 |---|---:|
-| Unit & security suite (`pytest`) | **78 passed, 1 xfailed** |
+| Unit & security suite (`pytest`) | **85 passed, 1 xfailed** |
 | PII leakage (`check_dev.py`) | **0 / 3,230** (0.0%) |
 | Canaries leaked | **0 / 4** |
-| Clinical preservation | **4,855 / 4,855** (100.0%) |
+| Clinical preservation | **4,779 / 4,855** (98.4%) |
 | Linkage precision | **1.00** |
 | Linkage recall | **0.85** |
 | Linkage F0.5 | **0.97** |
@@ -173,7 +173,7 @@ Measured on the supplied Secret-Wards practice dataset (`dev/input`: `200` files
 - **Conservative Linkage Trade-Off:** Requiring multi-point corroboration and cluster-wide `cannot-link` consistency yields `1.00` precision and `0` false merges while leaving ambiguous or sparsely corroborated records unlinked (`0.85` recall, `patient: null`).
 - **Unlabeled Free-Text Names:** Single-token or unlabeled person names in free text without structured, honorific, or kinship anchors may not be captured by the per-run gazetteer (tracked by the single `xfail` test).
 - **Quasi-Identifier Inference (A5):** Quasi-identifier generalization (`5-year` age bands, `3-digit` PIN prefixes) is not coupled to external population registries; an adversary with external facts and rare demographic combinations may still narrow small equivalence classes.
-- **Pseudonym Space & Host Metrics:** `PSN-XXXXXX` uses 30-bit Crockford Base32 with per-run collision checking; `peak_rss_mb` reports `0.0` fallback on Windows while Linux sandboxes report `resource.getrusage`.
+- **Pseudonym Space & Host Metrics:** `PSN-XXXXXXXXXXXXXXXX` uses 80-bit Crockford Base32 (`16` characters) with per-run collision checking and fail-closed retry bounds; `peak_rss_mb` is measured cross-platform via `resource.getrusage` on Linux/macOS and `K32GetProcessMemoryInfo` on Windows (`measurement_status: "measured"` or `"unavailable"`).
 
 ## 13. Repository Structure
 

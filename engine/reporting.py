@@ -9,12 +9,13 @@ from engine.exporter import atomic_write_text
 from engine.record_model import IngestedFile, PipelineStats
 
 
-def peak_rss_mb() -> float:
-    """Measure peak resident set size in MB (Linux/macOS via resource, Windows fallback)."""
+def peak_rss_mb() -> tuple[float | None, str]:
+    """Measure peak resident set size in MB (Linux/macOS via resource, Windows via K32GetProcessMemoryInfo)."""
     try:
         import resource
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return round(r / 1024.0 if sys.platform != "darwin" else r / 1048576.0, 2)
+        if r > 0:
+            return round(r / 1024.0 if sys.platform != "darwin" else r / 1048576.0, 2), "measured"
     except Exception:
         pass
     if sys.platform == "win32":
@@ -36,14 +37,24 @@ def peak_rss_mb() -> float:
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
 
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            handle = k32.GetCurrentProcess()
+
             pmc = PROCESS_MEMORY_COUNTERS()
             pmc.cb = ctypes.sizeof(pmc)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
-                return round(pmc.PeakWorkingSetSize / (1024 * 1024), 2)
+
+            get_mem = getattr(k32, "K32GetProcessMemoryInfo", None)
+            if get_mem is None:
+                get_mem = ctypes.windll.psapi.GetProcessMemoryInfo
+            get_mem.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+            get_mem.restype = wintypes.BOOL
+
+            if get_mem(handle, ctypes.byref(pmc), pmc.cb) and pmc.PeakWorkingSetSize > 0:
+                return round(pmc.PeakWorkingSetSize / (1024 * 1024), 2), "measured"
         except Exception:
             pass
-    return 0.0
+    return None, "unavailable"
 
 
 def write_report(
@@ -69,6 +80,7 @@ def write_report(
                 "reason": item.quarantine_reason or "quarantined",
             })
 
+    rss_mb, rss_status = peak_rss_mb()
     report = {
         "schema": "raksha-report/1",
         "files": file_entries,
@@ -85,6 +97,6 @@ def write_report(
         },
         "entities": dict(sorted(stats.entity_counts.items())),
         "timing": {"seconds": round(elapsed_seconds, 2)},
-        "resources": {"peak_rss_mb": peak_rss_mb()},
+        "resources": {"peak_rss_mb": rss_mb, "measurement_status": rss_status},
     }
     atomic_write_text(output_dir / "report.json", json.dumps(report, indent=2) + "\n")
