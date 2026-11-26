@@ -88,8 +88,8 @@ Configured via `config/policy.yaml`:
 
 - No LLMs, no generative models, no pretrained transformers, and no network calls during execution.
 - `RAKSHA_SECRET` is read solely from the environment and never logged, printed, or written to disk.
-- Atomic file writes via `tempfile.mkstemp` + `os.replace` prevent partial sanitized outputs.
-- AES-256-GCM helpers are provided in `KeyRing` for any temporary encrypted artifact needs.
+- Raw input data and intermediate structures (`IngestedFile`, `RecordUnit`, `clues`, `DynamicGazetteer`) are held strictly in memory and never written to disk; only already-sanitized outputs, `records.jsonl`, and `report.json` are written atomically via `tempfile.mkstemp` + `os.replace`.
+- `KeyRing` includes unit-tested AES-256-GCM helpers (`encrypt_bytes` / `decrypt_bytes`) for any future encrypted temp-file needs, though no disk intermediates are created in the current pipeline.
 - Unprocessable or malformed files are quarantined (`output/report.json` lists SHA-256 + reason) and never copied raw into `sanitized/`.
 
 ## 11. Installation
@@ -98,34 +98,51 @@ Configured via `config/policy.yaml`:
 pip install -r requirements.txt
 ```
 
-Dependencies: `cryptography`, `PyYAML`, `rapidfuzz`, `indic-transliteration`, `regex`, `pytest`.
+Dependencies: `cryptography`, `PyYAML`, `rapidfuzz`, `indic-transliteration`, `pytest`.
 
 ## 12. Execution
 
+`RAKSHA_SECRET` is **required** (non-empty, non-whitespace) and fails closed before creating any output directory if unset or blank.
+
+**PowerShell (Windows):**
+```powershell
+$env:RAKSHA_SECRET="your-secret-key"
+python main.py --input ..\Secret-Wards-ToolKit-LF\dev\input --output .\output\kavach-final
+```
+
+**Bash (Linux/macOS):**
 ```bash
-export RAKSHA_SECRET="your-secret-key"   # PowerShell: $env:RAKSHA_SECRET="practice"
+export RAKSHA_SECRET="your-secret-key"
 python main.py --input /path/to/input --output /path/to/output
 ```
 
 ## 13. Testing
 
-```bash
-pytest -v tests/
+```powershell
+python -m pytest -v tests\
 ```
 
-## 14. Measured Performance
+## 14. Measured Performance (Practice Dataset)
 
-Measured on `Secret-Wards-ToolKit/dev/input` (200 files, 822 exported records, 48 patients):
-- **Output Contract (`validate_output.py`):** `CONTRACT OK` (193 sanitized, 7 quarantined, 0 raw copies)
-- **Content PII Leakage (`check_dev.py`):** **0.2% leaked** in content (`hinglish: 0.0%`, `deva: 0.7%`, `base64: 0.0%`, `metadata: 0.0%`, `key: 0.0%`, `header: 0.0%`)
-- **Canaries Leaked:** **0 / 4**
-- **Medical Data Preserved:** **4,497 / 4,497 (100.0%)**
-- **Patient Linking:** Precision **1.00**, Recall **0.79**, F0.5 **0.95** (**0** false merges)
-- **Quasi-ID Equivalence (`age_band, district, gender`):** 389 structured records across 77 classes (6.43% unique `k=1` records)
-- **Runtime:** **10.31 seconds** on CPU
+Measured on the supplied practice/development dataset (`Secret-Wards-ToolKit-LF/dev/input`: **200 files**, **193 sanitized**, **7 quarantined**, **822 exported records**). These are practice-dataset measurements, **not** hidden-evaluation scores, and zero leakage on practice data does not guarantee zero leakage on arbitrary real-world datasets.
+
+| Metric | Result |
+|---|---:|
+| PII leakage (`check_dev.py`) | **0 / 3,230** |
+| Canaries leaked | **0 / 4** |
+| Clinical preservation | **4,855 / 4,855** (100.0%) |
+| Linkage precision | **1.00** |
+| Linkage recall | **0.85** |
+| Linkage F0.5 | **0.97** |
+| False merges | **0** |
+| Raw unsupported copies | **0** |
+| Output contract (`validate_output.py`) | **`CONTRACT OK`** (193 sanitized, 7 quarantined) |
+| Runtime (CPU) | **~8.5–10.2 seconds** |
+
+**Conservative Linkage Trade-off:** KAVACH-FHIR enforces cluster-wide cannot-link constraints and requires multi-point corroboration when strong IDs are absent. This yields **1.00 precision** and **0 false merges** at the cost of **0.85 recall** (leaving genuinely ambiguous or sparsely corroborated records unlinked as `patient: null`).
 
 ## 15. Limitations
 
-- Rare-diagnosis k-anonymity suppression is not yet dynamically coupled to external population registries, so an attacker with exact rare-disease + district + age-band knowledge can still narrow down small equivalence classes.
-- Unlabeled single-token names in free text that do not appear in any structured record or honorific/kinship pattern may not be caught by the per-run gazetteer.
+- Rare-diagnosis population-level privacy: k-anonymity suppression is not dynamically coupled to external population registries, so an attacker with exact rare-disease + district + age-band knowledge can still narrow down small equivalence classes.
+- Unlabeled names: unlabeled single-token names in free text that do not appear in any structured record, honorific, or kinship pattern may escape the per-run gazetteer.
 - Windows Git CRLF checkout alters line endings vs. Linux LF SHA-256 hashes in `dev/truth/truth.json`; on Linux evaluation sandboxes, SHA-256 hashes match natively.

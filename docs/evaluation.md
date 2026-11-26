@@ -1,17 +1,29 @@
-# KAVACH-FHIR Evaluation Summary
+# KAVACH-FHIR Evaluation Summary (Practice Dataset)
 
-Measured on `Secret-Wards-ToolKit/dev/input` (200 files, 48 patients) with `RAKSHA_SECRET=practice`:
+Measured on the supplied truth-hash-matched Secret-Wards practice/development dataset (`Secret-Wards-ToolKit-LF/dev/input`: **200 files**, **193 sanitized**, **7 quarantined**, **822 records**).
+
+> **Note:** These are results on the supplied practice/development dataset, **not** the official hidden-evaluation score. Zero leakage on the practice dataset does not guarantee zero leakage on arbitrary real-world datasets.
 
 | Metric | Starter Baseline | KAVACH-FHIR |
 |---|---:|---:|
-| Content PII Leaked | 83.5% | **0.2%** |
-| Hinglish PII Leaked | 100.0% | **0.0%** |
-| Devanagari PII Leaked | 100.0% | **0.7%** |
-| Base64 / Metadata / Key / Header Leaked | 100.0% | **0.0%** |
+| PII Leakage (`check_dev.py`) | 83.5%+ | **0 / 3,230** |
 | Canaries Leaked | 4 / 4 | **0 / 4** |
-| Medical Values Preserved | 100.0% | **100.0%** (4,497 / 4,497) |
-| Patient Linking Precision / Recall / F0.5 | 0.00 / 0.00 / 0.00 | **1.00 / 0.79 / 0.95** |
-| False Patient Merges | 0 | **0** |
+| Clinical Preservation | 100.0% | **4,855 / 4,855** (100.0%) |
+| Linkage Precision | 0.00 | **1.00** |
+| Linkage Recall | 0.00 | **0.85** |
+| Linkage F0.5 | 0.00 | **0.97** |
+| False Merges | 0 | **0** |
 | Raw Unsupported Copies | 0 | **0** |
+| Practice Dataset Files | 200 | **200** (193 sanitized, 7 quarantined) |
+| Exported Records | — | **822** |
 | Contract Validation | `CONTRACT OK` | **`CONTRACT OK`** |
-| Execution Time (CPU) | — | **10.31s** |
+| Execution Time (CPU) | — | **~8.5–10.2s** |
+
+## Conservative Linkage Trade-Off
+
+KAVACH-FHIR prioritizes precision over aggressive recall: shared phone numbers never link alone, name matches require multi-point corroboration, and every candidate merge passes cluster-wide cannot-link checks. This achieves **1.00 precision** and **0 false merges** while leaving ambiguous records unlinked (`0.85` recall, `0.97` F0.5).
+
+## Known Limitations
+
+- **Rare-diagnosis population-level privacy:** Quasi-identifier generalization (`5-year` age bands, `3-digit` PIN prefixes) is not coupled to external population registries; an adversary with exact rare-disease + district + age-band knowledge may still isolate small equivalence classes.
+- **Unlabeled names:** Single-token or unlabeled names in free text without structured, honorific, or kinship anchors may not be captured by the per-run gazetteer.
