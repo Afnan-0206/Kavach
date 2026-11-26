@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from functools import lru_cache
 import re
 
 from detectors.address_detector import detect_addresses
@@ -55,6 +56,7 @@ def resolve_overlaps(spans: list[EntitySpan]) -> list[EntitySpan]:
     return kept
 
 
+@lru_cache(maxsize=2048)
 def classify_field_name(field_name: str) -> str | None:
     """Semantically classify a CSV header or JSON key into a PII/quasi-ID category."""
     k = re.sub(r"[^a-z0-9/\s]", " ", normalize_text(field_name).lower()).strip()

@@ -196,7 +196,8 @@ def link_records(units: list[RecordUnit], keyring: KeyRing) -> None:
             dsu.try_union(a, b)
 
     # Assign deterministic canonical key and collision-checked HMAC pseudonym per cluster
-    used_pseudonyms: dict[str, str] = {}
+    used_pseudonyms: set[str] = set()
+    used_canon_keys: set[str] = set()
     for root, members in sorted(dsu.members.items()):
         # Determine if this cluster has enough identity evidence to deserve a pseudonym
         has_evidence = any(
@@ -233,12 +234,16 @@ def link_records(units: list[RecordUnit], keyring: KeyRing) -> None:
             continue
 
         canon_key = "|".join(evidence_parts)
+        if canon_key in used_canon_keys:
+            canon_key = f"{canon_key}|cluster:{root}"
+        used_canon_keys.add(canon_key)
+
         salt = 0
         psn = keyring.pseudonym(canon_key, salt)
-        while psn in used_pseudonyms and used_pseudonyms[psn] != canon_key:
+        while psn in used_pseudonyms:
             salt += 1
             psn = keyring.pseudonym(canon_key, salt)
-        used_pseudonyms[psn] = canon_key
+        used_pseudonyms.add(psn)
 
         for m in members:
             units[m].patient_key = canon_key

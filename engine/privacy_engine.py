@@ -98,6 +98,65 @@ def generalize_pin(pin: str, prefix_digits: int = 3) -> str:
     return "[PIN]"
 
 
+def extract_dates_in_text(text: str, month_first: bool = False) -> set[dt.date]:
+    """Extract all valid ISO or DD/MM/YYYY (or MM/DD/YYYY) dates from text."""
+    out: set[dt.date] = set()
+    if not text:
+        return out
+    s = normalize_text(text)
+    for m in _ISO_DATE_RE.finditer(s):
+        try:
+            out.add(dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+    for m in _DMY_DATE_RE.finditer(s):
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            if month_first and a <= 12:
+                out.add(dt.date(y, a, b))
+            elif b <= 12:
+                out.add(dt.date(y, b, a))
+            elif a <= 12:
+                out.add(dt.date(y, a, b))
+        except ValueError:
+            pass
+    return out
+
+
+def choose_collision_safe_shift(
+    keyring: KeyRing,
+    shift_key: str,
+    patient_dates: set[dt.date],
+    protected_dobs: set[dt.date],
+    max_days: int = 180,
+) -> int:
+    """Select a deterministic patient-level shift offset that never lands on any protected DOB."""
+    base = keyring.date_shift_days(shift_key, max_days=max_days, attempt=0)
+    if not patient_dates or not protected_dobs:
+        return base
+
+    def _is_safe(offset: int) -> bool:
+        return all((d + dt.timedelta(days=offset)) not in protected_dobs for d in patient_dates)
+
+    if _is_safe(base):
+        return base
+
+    # Try deterministic HMAC-derived alternative offsets
+    for attempt in range(1, 65):
+        cand = keyring.date_shift_days(shift_key, max_days=max_days, attempt=attempt)
+        if _is_safe(cand):
+            return cand
+
+    # Deterministic fallback sweep within [-max_days, +max_days], then [-365, +365]
+    for radius in (max_days, 365):
+        for delta in range(1, radius + 1):
+            for cand in (delta, -delta):
+                if _is_safe(cand):
+                    return cand
+
+    raise ValueError("Unable to find a collision-safe date shift outside protected DOBs")
+
+
 def get_shift_for_record(
     keyring: KeyRing,
     patient_key: str | None,

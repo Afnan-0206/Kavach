@@ -15,8 +15,8 @@ class KeyRing:
     """Derives domain-separated keys from RAKSHA_SECRET using HKDF-SHA256."""
 
     def __init__(self, secret: bytes) -> None:
-        if not secret:
-            secret = b"default-empty-secret-fallback"
+        if not secret or not secret.strip():
+            raise ValueError("RAKSHA_SECRET must be set to a non-empty, non-whitespace value")
         self._pseudonym_key = self._derive(secret, b"kavach-fhir:pseudonym:v1", 32)
         self._date_shift_key = self._derive(secret, b"kavach-fhir:date-shift:v1", 32)
         self._filename_key = self._derive(secret, b"kavach-fhir:filename:v1", 32)
@@ -47,18 +47,24 @@ class KeyRing:
         code = "".join(_CROCKFORD_B32[(n >> (5 * i)) & 31] for i in range(6))
         return f"PSN-{code}"
 
-    def date_shift_days(self, canonical_key: str, max_days: int = 180) -> int:
+    def date_shift_days(self, canonical_key: str, max_days: int = 180, attempt: int = 0) -> int:
         """Deterministic non-zero date shift in [-max_days, +max_days]."""
         if max_days <= 0:
             return 1
-        digest = hmac.new(self._date_shift_key, canonical_key.encode("utf-8"), hashlib.sha256).digest()
+        msg = canonical_key.encode("utf-8")
+        if attempt:
+            msg += f"|attempt:{attempt}".encode("utf-8")
+        digest = hmac.new(self._date_shift_key, msg, hashlib.sha256).digest()
         val = int.from_bytes(digest[:4], "big") % (2 * max_days) - max_days
         return val if val != 0 else 1
 
-    def safe_file_token(self, rel_path: str) -> str:
-        """Deterministic 8-char hex token for renaming files whose names contain PII."""
-        digest = hmac.new(self._filename_key, rel_path.encode("utf-8"), hashlib.sha256).digest()
-        return digest[:4].hex()
+    def safe_file_token(self, rel_path: str, collision_salt: int = 0) -> str:
+        """Deterministic 12-char hex token for opaque output filenames/directories."""
+        msg = rel_path.encode("utf-8")
+        if collision_salt:
+            msg += f"|{collision_salt}".encode("utf-8")
+        digest = hmac.new(self._filename_key, msg, hashlib.sha256).digest()
+        return digest[:6].hex()
 
     def encrypt_bytes(self, plaintext: bytes) -> bytes:
         """Encrypt temporary disk artifacts with AES-256-GCM (deterministic nonce-free not used here; random 96-bit nonce)."""

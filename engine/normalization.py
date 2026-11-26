@@ -46,6 +46,8 @@ def normalize_text(text: str) -> str:
     """Normalize NFKC, strip zero-width chars, fold homoglyphs, and convert Indic digits."""
     if not text:
         return ""
+    if text.isascii():
+        return text
     s = unicodedata.normalize("NFKC", text)
     s = _ZERO_WIDTH_RE.sub("", s)
     s = s.translate(_HOMOGLYPHS)

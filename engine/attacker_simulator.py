@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
-import json
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -22,9 +22,9 @@ def estimate_equivalence_risk(sanitized_dir: Path) -> dict[str, float | int]:
         if len(rows) < 2:
             continue
         headers = [h.lower() for h in rows[0]]
-        age_idx = next((i for i, h in enumerate(headers) if "age" in h or "umar" in h), None)
-        dist_idx = next((i for i, h in enumerate(headers) if "district" in h or "jila" in h), None)
-        sex_idx = next((i for i, h in enumerate(headers) if h in ("sex", "gender", "ling")), None)
+        age_idx = next((i for i, h in enumerate(headers) if re.search(r"\b(?:age|umar|आयु|उम्र)\b", h)), None)
+        dist_idx = next((i for i, h in enumerate(headers) if re.search(r"\b(?:district|jila|जिला)\b", h)), None)
+        sex_idx = next((i for i, h in enumerate(headers) if h in ("sex", "gender", "ling", "लिंग")), None)
         if age_idx is None and dist_idx is None:
             continue
         for row in rows[1:]:
