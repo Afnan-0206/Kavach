@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hmac
 import html
@@ -14,6 +15,7 @@ import secrets
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +39,7 @@ def parse_report_json(report_path: Path) -> dict[str, Any]:
         return {"available": False}
     try:
         data = json.loads(report_path.read_text(encoding="utf-8"))
+        mtime = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except (OSError, ValueError):
         return {"available": False}
     if not isinstance(data, dict):
@@ -44,6 +47,23 @@ def parse_report_json(report_path: Path) -> dict[str, Any]:
     counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
     timing = data.get("timing") if isinstance(data.get("timing"), dict) else {}
     entities = data.get("entities") if isinstance(data.get("entities"), dict) else {}
+    resources = data.get("resources") if isinstance(data.get("resources"), dict) else {}
+    raw_files = data.get("files") if isinstance(data.get("files"), list) else []
+    quarantined_files: list[dict[str, Any]] = []
+    for idx, entry in enumerate(raw_files):
+        if not isinstance(entry, dict):
+            continue
+        status = str(entry.get("status", ""))
+        if status and status != "sanitized":
+            sha = str(entry.get("input_sha256", "")).strip()
+            quarantined_files.append(
+                {
+                    "id": sha[:12] if sha else f"quar-{idx + 1}",
+                    "status": status,
+                    "reason": str(entry.get("reason") or "quarantined"),
+                    "raw_copy_prevented": True,
+                }
+            )
     return {
         "available": True,
         "schema": str(data.get("schema", "Not reported")),
@@ -54,8 +74,136 @@ def parse_report_json(report_path: Path) -> dict[str, Any]:
         "records_linked": counts.get("records_linked", "Not reported"),
         "identifiers_detected": counts.get("identifiers_detected", "Not reported"),
         "timing_seconds": timing.get("seconds", "Not reported"),
+        "peak_rss_mb": resources.get("peak_rss_mb", "Not reported"),
+        "rss_status": str(resources.get("measurement_status", "Not reported")),
+        "last_updated": mtime,
         "entities": {str(k): int(v) for k, v in entities.items() if isinstance(v, (int, float))},
+        "quarantined_files": quarantined_files,
     }
+
+
+def _norm_probe_text(s: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(s).lower()))
+
+
+def _with_decoded_b64(text: str) -> str:
+    extra: list[str] = []
+    for tok in re.findall(r"[A-Za-z0-9+/]{24,}={0,2}", text):
+        try:
+            raw = base64.b64decode(tok, validate=True).decode("utf-8", errors="ignore")
+            if raw:
+                extra.append(raw)
+        except Exception:
+            pass
+    return text if not extra else text + "\n" + "\n".join(extra)
+
+
+def compute_probe_breakdown(sanitized_dir: Path, truth_json: Path) -> dict[str, Any] | None:
+    """Compute aggregate Preservation Probe Retention by category without exposing probe text."""
+    if not sanitized_dir.is_dir() or not truth_json.is_file():
+        return None
+    try:
+        truth = json.loads(truth_json.read_text(encoding="utf-8"))
+        # Build input sha256 -> sanitized relative path map from report.json if available
+        sha_map: dict[str, str] = {}
+        rep_path = sanitized_dir.parent / "report.json"
+        if rep_path.is_file():
+            try:
+                rep_data = json.loads(rep_path.read_text(encoding="utf-8"))
+                for rf in rep_data.get("files") or []:
+                    if isinstance(rf, dict) and rf.get("input_sha256") and rf.get("output"):
+                        sha_map[str(rf["input_sha256"])] = str(rf["output"]).replace("\\", "/").replace("sanitized/", "", 1)
+            except ValueError:
+                pass
+
+        file_text_cache: dict[str, str] = {}
+
+        def _file_norm_text(rel: str, sha: str = "") -> str:
+            out_rel = sha_map.get(sha, rel.replace("\\", "/"))
+            if out_rel not in file_text_cache:
+                target = sanitized_dir / out_rel
+                if target.is_file():
+                    raw = target.read_text(encoding="utf-8", errors="ignore")
+                    file_text_cache[out_rel] = _norm_probe_text(_with_decoded_b64(raw))
+                else:
+                    file_text_cache[out_rel] = ""
+            return file_text_cache[out_rel]
+
+        by_kind: dict[str, dict[str, int]] = {}
+        retained = 0
+
+        if isinstance(truth.get("files"), dict):
+            for rel, f_entry in truth["files"].items():
+                if not isinstance(f_entry, dict):
+                    continue
+                units = f_entry.get("units")
+                if not isinstance(units, dict):
+                    continue
+                ftext = _file_norm_text(str(rel), str(f_entry.get("sha256") or ""))
+                if not ftext:
+                    continue
+                for u in units.values():
+                    if not isinstance(u, dict):
+                        continue
+                    for pv in u.get("preserve") or []:
+                        if not isinstance(pv, dict):
+                            continue
+                        kind = str(pv.get("kind", "unknown"))
+                        np = _norm_probe_text(str(pv.get("text", "")))
+                        bucket = by_kind.setdefault(kind, {"total": 0, "retained": 0, "lost": 0})
+                        bucket["total"] += 1
+                        if np and np in ftext:
+                            bucket["retained"] += 1
+                            retained += 1
+                        else:
+                            bucket["lost"] += 1
+        elif isinstance(truth.get("preserve"), list):
+            norm_texts: list[str] = []
+            for p in sorted(sanitized_dir.rglob("*")):
+                if p.is_file():
+                    try:
+                        raw = p.read_text(encoding="utf-8", errors="ignore")
+                        norm_texts.append(_norm_probe_text(_with_decoded_b64(raw)))
+                    except OSError:
+                        continue
+            joined = "\n".join(norm_texts)
+            for probe in truth["preserve"]:
+                if not isinstance(probe, dict):
+                    continue
+                kind = str(probe.get("kind", "unknown"))
+                np = _norm_probe_text(str(probe.get("text", "")))
+                bucket = by_kind.setdefault(kind, {"total": 0, "retained": 0, "lost": 0})
+                bucket["total"] += 1
+                if np and np in joined:
+                    bucket["retained"] += 1
+                    retained += 1
+                else:
+                    bucket["lost"] += 1
+
+        total = sum(b["total"] for b in by_kind.values())
+        if not total:
+            return None
+        demographic_kinds = {"district", "hospital", "age", "pin", "pincode"}
+        categories = [
+            {
+                "kind": k,
+                "group": "demographic" if k in demographic_kinds else "clinical",
+                "retained": v["retained"],
+                "total": v["total"],
+                "lost": v["lost"],
+                "pct": round((100.0 * v["retained"] / v["total"]), 1) if v["total"] else 100.0,
+            }
+            for k, v in sorted(by_kind.items(), key=lambda kv: (-kv[1]["lost"], -kv[1]["total"], kv[0]))
+        ]
+        return {
+            "total": total,
+            "retained": retained,
+            "lost": total - retained,
+            "pct": round((100.0 * retained / total), 1) if total else 100.0,
+            "categories": categories,
+        }
+    except (OSError, ValueError):
+        return None
 
 
 def parse_check_dev_output(stdout: str) -> dict[str, Any]:
@@ -197,6 +345,9 @@ class DashboardState:
         self.validate_exit_code: int | None = None
         self.check_dev_exit_code: int | None = None
         self.contract_status = "Not reported"
+        self.last_error: str | None = None
+        self.eval_timestamp: str | None = None
+        self.probe_breakdown: dict[str, Any] | None = None
         self.eval_metrics: dict[str, Any] = {
             "pii_leakage": "Not reported",
             "canaries": "Not reported",
@@ -208,11 +359,29 @@ class DashboardState:
             "raw_copies": "Not reported",
         }
 
+    def _compute_execution_state(self) -> str:
+        if self.pipeline_status == "running":
+            return "pipeline_running"
+        if self.eval_status == "running":
+            return "evaluation_running"
+        if self.pipeline_status == "failed" or self.eval_status == "failed":
+            return "failed"
+        if self.pipeline_status == "succeeded" or self.eval_status == "completed":
+            return "completed"
+        return "idle"
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             report = parse_report_json(self.output_dir / "report.json")
             files = list_sanitized_files(self.sanitized_dir)
+            execution_state = self._compute_execution_state()
             return {
+                "execution_state": execution_state,
+                "last_error": self.last_error,
+                "input_label": self.input_dir.name,
+                "output_label": self.output_dir.name,
+                "eval_timestamp": self.eval_timestamp,
+                "probe_breakdown": self.probe_breakdown,
                 "secret_configured": _is_secret_configured(),
                 "pipeline": {
                     "status": self.pipeline_status,
@@ -245,6 +414,7 @@ class DashboardState:
             self.pipeline_status = "running"
             self.pipeline_exit_code = None
             self.pipeline_message = "Running privacy firewall..."
+            self.last_error = None
 
         threading.Thread(target=self._run_pipeline_worker, daemon=True).start()
         return True, "Pipeline started."
@@ -272,6 +442,7 @@ class DashboardState:
                 else:
                     self.pipeline_status = "failed"
                     self.pipeline_message = f"Pipeline failed (exit code {proc.returncode})."
+                    self.last_error = f"Pipeline exited with code {proc.returncode}. Inspect local terminal for details."
             if proc.returncode == 0 and self.toolkit_dir:
                 val_py = self.toolkit_dir / "validate_output.py"
                 chk_py = self.toolkit_dir / "check_dev.py"
@@ -286,6 +457,7 @@ class DashboardState:
                 self.pipeline_status = "failed"
                 self.pipeline_exit_code = 1
                 self.pipeline_message = "Pipeline execution error."
+                self.last_error = "Pipeline execution error. Inspect local terminal for details."
 
     def start_evaluation(self) -> tuple[bool, str]:
         if not self.toolkit_dir:
@@ -302,6 +474,7 @@ class DashboardState:
                 return False, "Another job is already running."
             self.eval_status = "running"
             self.eval_message = "Running validate_output.py and check_dev.py..."
+            self.last_error = None
 
         threading.Thread(target=self._run_eval_worker, args=(val_py, chk_py, truth_json), daemon=True).start()
         return True, "Evaluation started."
@@ -324,21 +497,27 @@ class DashboardState:
             )
             contract = parse_validate_output(vo.stdout, vo.returncode)
             metrics = parse_check_dev_output(cd.stdout)
+            breakdown = compute_probe_breakdown(self.sanitized_dir, truth_json)
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             with self._lock:
                 self.validate_exit_code = vo.returncode
                 self.check_dev_exit_code = cd.returncode
                 self.contract_status = contract
                 self.eval_metrics = metrics
+                self.probe_breakdown = breakdown
+                self.eval_timestamp = ts
                 if vo.returncode == 0 and cd.returncode == 0:
                     self.eval_status = "completed"
                     self.eval_message = "Official practice evaluation and contract check completed."
                 else:
                     self.eval_status = "failed"
                     self.eval_message = f"Evaluator exited with codes validate={vo.returncode}, check_dev={cd.returncode}."
+                    self.last_error = self.eval_message
         except (OSError, subprocess.SubprocessError):
             with self._lock:
                 self.eval_status = "failed"
                 self.eval_message = "Evaluator execution error."
+                self.last_error = "Evaluator execution error. Inspect local terminal for details."
 
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -361,8 +540,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     --card-white: #FDFDFD;
 
     --text-primary: #252623;
-    --text-secondary: #777A75;
-    --text-muted: #999B94;
+    --text-secondary: #595C56;
+    --text-muted: #5D5F5A;
 
     --border-soft: #D2D2CB;
 
@@ -887,8 +1066,44 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .sec-card h4 { margin: 0; font-size: 0.88rem; font-weight: 500; }
   .sec-card p { margin: 0; font-size: 0.74rem; color: var(--text-secondary); }
 
-  /* Bottom Floating Navigation Rail */
+  /* Expandable Details, Tooltips & Evidence Badges */
+  .info-tip {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%; margin-left: 4px;
+    background: var(--surface-alt); border: 1px solid var(--border-soft);
+    color: var(--text-primary); font-size: 0.64rem; font-weight: 700;
+    cursor: help; vertical-align: middle;
+  }
+  .info-tip:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible {
+    outline: 2px solid var(--frame-dark); outline-offset: 2px;
+  }
+  .detail-drawer {
+    background: var(--card-white); border: 1px solid var(--border-soft);
+    border-radius: 18px; padding: 10px 14px; box-shadow: var(--shadow-soft);
+  }
+  .detail-drawer summary {
+    cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--text-primary);
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .detail-grid {
+    margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px; font-size: 0.74rem;
+  }
+  .detail-chip {
+    background: var(--surface-alt); border: 1px solid var(--border-soft);
+    border-radius: 12px; padding: 7px 10px; display: flex; justify-content: space-between; gap: 8px;
+  }
+  .clickable-card { cursor: pointer; text-align: left; width: 100%; font: inherit; color: inherit; }
+  .clickable-card:hover { border-color: var(--accent-olive); }
+  .scope-note {
+    font-size: 0.72rem; color: var(--text-secondary); background: var(--surface-alt);
+    border: 1px solid var(--border-soft); border-radius: 14px; padding: 8px 12px;
+  }
+  .sec-meta { font-size: 0.68rem; font-family: var(--mono); color: var(--text-muted); margin-top: auto; }
+
+  /* Bottom Floating Navigation Rail (mobile/tablet only) */
   .bottom-rail-wrap { display: flex; justify-content: center; flex-shrink: 0; padding-top: 2px; }
+  @media (min-width: 769px) { .bottom-rail-wrap { display: none; } }
   .bottom-rail {
     display: inline-flex; align-items: center; gap: 5px; padding: 5px; border-radius: 999px;
     background: rgba(247, 247, 244, 0.96); border: 1px solid var(--border-soft);
@@ -983,33 +1198,35 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
                 <div class="summary-meta">
                   <div class="meta-item"><span>Execution Status</span><strong id="pipe-msg">Ready to run</strong></div>
-                  <div class="meta-item"><span>Supported Formats</span><strong>5 (CSV, TSV, JSON, FHIR, TXT)</strong></div>
+                  <div class="meta-item"><span>Run Scope (Input &rarr; Output)</span><strong id="ov-scope">-</strong></div>
                   <div class="meta-item"><span>Records Processed</span><strong id="ov-records">Not reported</strong></div>
-                  <div class="meta-item"><span>Processing Runtime</span><strong id="ov-runtime">Not reported</strong></div>
+                  <div class="meta-item"><span>Runtime &amp; Peak RSS</span><strong id="ov-runtime">Not reported</strong></div>
+                  <div class="meta-item"><span>Last Updated</span><strong id="ov-updated">Not reported</strong></div>
+                  <div class="meta-item"><span>Supported Formats</span><strong>5 (CSV, TSV, JSON, FHIR, TXT)</strong></div>
                 </div>
               </div>
 
               <div class="vitals-grid">
-                <div class="vital-card">
+                <button type="button" class="vital-card clickable-card" onclick="setRoute('pipeline')">
                   <div class="vital-icon" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
                   <div><div class="vital-label">Total Files</div><div id="k-total" class="vital-val">Not reported</div><div class="vital-sub">Input corpus</div></div>
-                </div>
-                <div class="vital-card">
+                </button>
+                <button type="button" class="vital-card clickable-card" onclick="setRoute('files')">
                   <div class="vital-icon" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-                  <div><div class="vital-label">Sanitized</div><div id="k-sanitized" class="vital-val">Not reported</div><div class="vital-sub">Exported safely</div></div>
-                </div>
-                <div class="vital-card">
+                  <div><div class="vital-label">Sanitized</div><div id="k-sanitized" class="vital-val">Not reported</div><div class="vital-sub">Inspect sanitized/</div></div>
+                </button>
+                <button type="button" class="vital-card clickable-card" onclick="setRoute('pipeline')">
                   <div class="vital-icon" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></div>
                   <div><div class="vital-label">Quarantined</div><div id="k-quarantined" class="vital-val">Not reported</div><div class="vital-sub">0 raw copies</div></div>
-                </div>
-                <div class="vital-card">
+                </button>
+                <button type="button" class="vital-card clickable-card" onclick="setRoute('pipeline')">
                   <div class="vital-icon" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="7" y1="9" x2="17" y2="9"/><line x1="7" y1="13" x2="13" y2="13"/></svg></div>
                   <div><div class="vital-label">Records</div><div id="k-records" class="vital-val">Not reported</div><div class="vital-sub">Structured &amp; notes</div></div>
-                </div>
-                <div class="vital-card">
+                </button>
+                <button type="button" class="vital-card clickable-card" onclick="setRoute('evaluation')">
                   <div class="vital-icon" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
                   <div><div class="vital-label">Linked</div><div id="k-linked" class="vital-val">Not reported</div><div id="k-unlinked" class="vital-sub">Unresolved: -</div></div>
-                </div>
+                </button>
               </div>
             </div>
 
@@ -1018,18 +1235,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
               <button class="mini-stage" onclick="setRoute('pipeline')"><span class="mini-dot">1</span><div class="mini-stage-text"><span>Ingestion</span><strong id="ms-1">Not reported</strong></div></button>
               <button class="mini-stage" onclick="setRoute('pipeline')"><span class="mini-dot">2</span><div class="mini-stage-text"><span>PII Detection</span><strong id="ms-2">Not reported</strong></div></button>
               <button class="mini-stage" onclick="setRoute('pipeline')"><span class="mini-dot">3</span><div class="mini-stage-text"><span>Linkage</span><strong id="ms-3">Not reported</strong></div></button>
-              <button class="mini-stage" onclick="setRoute('pipeline')"><span class="mini-dot">4</span><div class="mini-stage-text"><span>Clinical Shield</span><strong id="ms-4">Not reported</strong></div></button>
-              <button class="mini-stage" onclick="setRoute('pipeline')"><span class="mini-dot">5</span><div class="mini-stage-text"><span>Privacy</span><strong>HMAC + Shift</strong></div></button>
+              <button class="mini-stage" onclick="setRoute('evaluation')"><span class="mini-dot">4</span><div class="mini-stage-text"><span>Probe Retention</span><strong id="ms-4">Not reported</strong></div></button>
+              <button class="mini-stage" onclick="setRoute('security')"><span class="mini-dot">5</span><div class="mini-stage-text"><span>Privacy</span><strong>HMAC + Shift</strong></div></button>
               <button class="mini-stage" onclick="setRoute('evaluation')"><span class="mini-dot">6</span><div class="mini-stage-text"><span>Contract</span><strong id="ms-6">Not run yet</strong></div></button>
             </div>
 
             <div class="overview-bottom">
               <div class="info-card white">
-                <div class="card-head"><h3>Entity Detection Summary</h3><span id="schema-pill" class="fmt-pill">schema: Not reported</span></div>
+                <div class="card-head"><h3>Entity Detection Summary</h3><button type="button" class="fmt-pill clickable-card" style="width:auto;" onclick="setRoute('pipeline')" id="schema-pill">schema: Not reported</button></div>
                 <div id="entities-bars" class="entity-bars"><div class="vital-sub">Run pipeline to populate entity counts from report.json.</div></div>
               </div>
               <div class="info-card">
-                <div class="card-head"><h3>Identity Resolution Summary</h3><span class="fmt-pill">F0.5 Priority</span></div>
+                <div class="card-head"><h3>Identity Resolution Summary</h3><button type="button" class="fmt-pill clickable-card" style="width:auto;" onclick="setRoute('evaluation')">F0.5 Priority &rarr;</button></div>
                 <div class="kv-grid">
                   <div class="kv-box"><span>Precision</span><strong id="ov-prec">Not reported</strong></div>
                   <div class="kv-box"><span>Recall</span><strong id="ov-rec">Not reported</strong></div>
@@ -1038,9 +1255,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
               </div>
               <div class="info-card white">
-                <div class="card-head"><h3>Clinical &amp; Evaluation Status</h3><span id="eval-pill" class="status-pill light">Not run yet</span></div>
+                <div class="card-head"><h3>Probe Retention &amp; Evaluation</h3><span id="eval-pill" class="status-pill light">Not run yet</span></div>
                 <div class="kv-grid">
-                  <div class="kv-box"><span>Clinical Preserved</span><strong id="ov-med">Not reported</strong></div>
+                  <div class="kv-box"><span>Probe Retention <span class="info-tip" tabindex="0" title="Preservation Probe Retention across all truth.json preserve probes. Clinical facts stay 100%; 76 district probes are generalized to [REGION] for k-anonymity.">?</span></span><strong id="ov-med">Not reported</strong></div>
                   <div class="kv-box"><span>PII Leakage</span><strong id="ov-pii">Not reported</strong></div>
                   <div class="kv-box"><span>Canaries</span><strong id="ov-can">Not reported</strong></div>
                   <div class="kv-box"><span>Contract</span><strong id="ov-contract">Not reported</strong></div>
@@ -1112,7 +1329,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
                   <span class="stage-kicker">4. Clinical Shield</span>
                   <div class="stage-stem"></div>
                   <article class="stage-card">
-                    <h3 class="stage-title">Clinical Preservation</h3>
+                    <h3 class="stage-title">Preservation Probe Retention</h3>
                     <div id="st4-med" class="stage-stat">Not reported</div>
                     <div class="fmt-pills"><span class="fmt-pill">Medicines</span><span class="fmt-pill">Dosages</span><span class="fmt-pill">Diagnoses</span><span class="fmt-pill">Labs</span><span class="fmt-pill">Vitals</span></div>
                   </article>
@@ -1141,6 +1358,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
               </div>
             </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:10px;">
+              <details class="detail-drawer" id="pl-entities-details">
+                <summary><span>All Detected PII Entity Categories</span><span class="fmt-pill" id="pl-ent-count">0 categories</span></summary>
+                <div id="pl-all-entities" class="detail-grid"><div class="vital-sub">Run pipeline to inspect full entity breakdown.</div></div>
+              </details>
+              <details class="detail-drawer" id="pl-quarantine-details">
+                <summary><span>Quarantine Report (Safe Metadata Only)</span><span class="fmt-pill" id="pl-quar-count">0 quarantined</span></summary>
+                <div id="pl-quarantine-list" class="detail-grid"><div class="vital-sub">No quarantined files recorded.</div></div>
+              </details>
+            </div>
+            <div class="scope-note" id="pl-timing-note">Total pipeline runtime is read from report.json (per-stage sub-timings are not instrumented in raksha-report/1).</div>
           </section>
 
           <!-- VIEW 3: SANITIZED FILES -->
@@ -1189,24 +1418,30 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
                 <p id="eval-state-text" class="page-sub">Not run yet</p>
               </div>
               <div class="marker-row" style="align-items:center;">
-                <span id="chk-pipe" class="marker">Pipeline: Not run yet</span>
-                <span id="chk-eval" class="marker">Practice Eval: Not run yet</span>
-                <span id="chk-val" class="marker">Contract: Not run yet</span>
-                <span class="marker">Full Submission Check: CLI only</span>
+                <span id="chk-pipe" class="marker">1. Pipeline: Not run yet</span>
+                <span id="chk-eval" class="marker">2. Practice Eval (check_dev.py): Not run yet</span>
+                <span id="chk-val" class="marker">3. Output Contract (validate_output.py): Not reported</span>
+                <span class="marker">4. Full Submission Check (check_submission.py): CLI ONLY</span>
               </div>
             </div>
 
             <div class="eval-grid">
-              <div class="eval-card highlight"><span>PII Leakage</span><strong id="ev-pii">Not reported</strong></div>
-              <div class="eval-card"><span>Canary Leakage</span><strong id="ev-can">Not reported</strong></div>
-              <div class="eval-card highlight"><span>Clinical Preservation</span><strong id="ev-med">Not reported</strong></div>
-              <div class="eval-card"><span>Linkage Precision</span><strong id="ev-prec">Not reported</strong></div>
-              <div class="eval-card"><span>Linkage Recall</span><strong id="ev-rec">Not reported</strong></div>
-              <div class="eval-card"><span>F0.5 Score</span><strong id="ev-f05">Not reported</strong></div>
+              <div class="eval-card highlight"><span>PII Leakage <span class="info-tip" tabindex="0" title="Visible ground-truth PII items in sanitized output (check_dev.py denominator: 3,230 practice PII probes).">?</span></span><strong id="ev-pii">Not reported</strong></div>
+              <div class="eval-card"><span>Canary Leakage <span class="info-tip" tabindex="0" title="Synthetic high-risk canary strings detected in sanitized output (practice corpus: 4 canaries).">?</span></span><strong id="ev-can">Not reported</strong></div>
+              <div class="eval-card highlight"><span>Preservation Probe Retention <span class="info-tip" tabindex="0" title="All truth.json preserve probes (total 4,855). Clinical categories remain 100%; generalized demographic probes (e.g. 76 district probes -> [REGION]) reflect intentional k-anonymity protection.">?</span></span><strong id="ev-med">Not reported</strong></div>
+              <div class="eval-card"><span>Linkage Precision <span class="info-tip" tabindex="0" title="Fraction of predicted patient record links that are true matches (F0.5 prioritizes precision over recall).">?</span></span><strong id="ev-prec">Not reported</strong></div>
+              <div class="eval-card"><span>Linkage Recall <span class="info-tip" tabindex="0" title="Fraction of true patient links successfully recovered across formats.">?</span></span><strong id="ev-rec">Not reported</strong></div>
+              <div class="eval-card"><span>F0.5 Score <span class="info-tip" tabindex="0" title="Weighted linkage score emphasizing precision twice as much as recall.">?</span></span><strong id="ev-f05">Not reported</strong></div>
               <div class="eval-card"><span>False Merges</span><strong id="ev-merges">Not reported</strong></div>
               <div class="eval-card"><span>Raw Copies</span><strong id="ev-raw">Not reported</strong></div>
               <div class="eval-card highlight"><span>Contract Validation</span><strong id="ev-contract">Not reported</strong></div>
             </div>
+
+            <details class="detail-drawer" id="eval-probe-details">
+              <summary><span>Preservation Probe Retention Breakdown (Clinical Facts vs. Quasi-Identifier Generalization)</span><span class="fmt-pill" id="ev-probe-summary">Run evaluation to compute</span></summary>
+              <div id="eval-probe-breakdown" class="detail-grid"><div class="vital-sub">Run official practice evaluation to separate 100% clinical retention from intentional demographic generalization.</div></div>
+            </details>
+            <div class="scope-note">Practice dataset scores reflect local dev/truth.json only and are distinct from hidden evaluation. Run <code>check_submission.py --repo . --run</code> in CLI for full submission verification.</div>
           </section>
 
           <!-- VIEW 5: SECURITY -->
@@ -1214,20 +1449,20 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="pipeline-header">
               <div>
                 <h2 class="page-title" style="font-size:1.2rem;">Security &amp; Cryptographic Controls</h2>
-                <p class="page-sub">Verified runtime boundaries — secrets and raw PII are never exposed</p>
+                <p class="page-sub">Distinguishing Browser Dashboard boundaries from CLI Pipeline execution controls</p>
               </div>
               <span id="sec-secret-chip" class="status-pill light">RAKSHA_SECRET: Checking</span>
             </div>
 
             <div class="security-grid">
-              <div class="sec-card"><h4>Localhost-Only Access</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified (127.0.0.1)</span><p>Server binds strictly to 127.0.0.1 with no external network listeners.</p></div>
-              <div class="sec-card"><h4>Offline Execution</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Zero external CDNs, fonts, analytics, or outbound HTTP requests.</p></div>
-              <div class="sec-card"><h4>LLM-Free Processing</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Deterministic CPU-only pipeline with zero hosted or generative models.</p></div>
-              <div class="sec-card"><h4>Fail-Closed Secret Handling</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Missing, empty, or whitespace-only RAKSHA_SECRET blocks execution before creating output.</p></div>
-              <div class="sec-card"><h4>Input Immutability</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Source files are read-only; no raw input or secret is written to browser or logs.</p></div>
-              <div class="sec-card"><h4>Quarantine Isolation</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Unsupported or malformed inputs are quarantined and never copied raw into sanitized/.</p></div>
-              <div class="sec-card"><h4>Path Traversal Protection</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Preview endpoint enforces realpath containment strictly inside sanitized/.</p></div>
-              <div class="sec-card"><h4>Deterministic Execution</h4><span class="status-pill light" style="align-self:flex-start;">Verify via CLI</span><p>Run check_submission.py --repo . --run to confirm repeat-run determinism and READY TO SUBMIT.</p></div>
+              <div class="sec-card"><h4>Localhost-Only Binding (Dashboard)</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Server binds strictly to 127.0.0.1 with Host/Origin validation and per-session CSRF token.</p><div class="sec-meta">Evidence: tests/test_dashboard.py (bind + CSRF/Host/Origin)</div></div>
+              <div class="sec-card"><h4>Offline Execution (Dashboard &amp; CLI)</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Zero external CDNs, fonts, analytics, or outbound HTTP requests; strict CSP enforced.</p><div class="sec-meta">Evidence: tests/test_dashboard.py (AST + HTML scan)</div></div>
+              <div class="sec-card"><h4>Path Traversal Containment (Dashboard)</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Preview endpoint enforces realpath containment strictly inside sanitized/.</p><div class="sec-meta">Evidence: tests/test_dashboard.py (preview traversal)</div></div>
+              <div class="sec-card"><h4>LLM-Free CPU Pipeline (CLI)</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Deterministic CPU-only regex/lexicon/linker pipeline with zero hosted or generative models.</p><div class="sec-meta">Evidence: engine/ &amp; detectors/ static imports</div></div>
+              <div class="sec-card"><h4>Fail-Closed Secret Handling (CLI &amp; UI)</h4><span id="sec-failclosed-badge" class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Missing, empty, or whitespace-only RAKSHA_SECRET blocks execution before creating output.</p><div class="sec-meta">Evidence: tests/test_security.py + dashboard /api/run</div></div>
+              <div class="sec-card"><h4>Input Immutability (CLI)</h4><span class="status-pill light ok" style="align-self:flex-start;">Verified</span><p>Source files are read-only; no raw input or secret is written to browser or logs.</p><div class="sec-meta">Evidence: tests/test_security.py + tests/test_dashboard.py</div></div>
+              <div class="sec-card"><h4>Quarantine Isolation (CLI)</h4><span id="sec-quar-badge" class="status-pill light" style="align-self:flex-start;">Not verified yet</span><p>Malformed inputs are quarantined and never copied raw into sanitized/.</p><div id="sec-quar-meta" class="sec-meta">Evidence: Run evaluation (check_dev.py RAW COPIES)</div></div>
+              <div class="sec-card"><h4>Deterministic Repeat-Run (CLI ONLY)</h4><span class="status-pill light" style="align-self:flex-start;">CLI only</span><p>Repeat-run byte determinism and READY TO SUBMIT must be verified from the terminal.</p><div class="sec-meta">Evidence: python ../Secret-Wards-ToolKit-LF/check_submission.py --repo . --run</div></div>
             </div>
           </section>
         </div>
@@ -1255,6 +1490,8 @@ let fmtFilter = 'all';
 let folderFilter = 'all';
 let pollTimer = null;
 let lastPreviewText = '';
+let lastSnapshot = null;
+let lastExecState = 'idle';
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1341,24 +1578,31 @@ async function refreshStatus() {
   try {
     const res = await fetch('/api/status');
     const st = await res.json();
+    lastSnapshot = st;
 
     const secPill = document.getElementById('secret-pill');
     const secChip = document.getElementById('sec-secret-chip');
+    const failClosedBadge = document.getElementById('sec-failclosed-badge');
     if (st.secret_configured) {
       secPill.textContent = 'RAKSHA_SECRET: Configured';
       secPill.className = 'status-pill ok';
       secChip.textContent = 'RAKSHA_SECRET: Configured (hidden)';
       secChip.className = 'status-pill light ok';
+      failClosedBadge.textContent = 'Verified';
+      failClosedBadge.className = 'status-pill light ok';
     } else {
       secPill.textContent = 'RAKSHA_SECRET: Missing';
       secPill.className = 'status-pill bad';
       secChip.textContent = 'RAKSHA_SECRET: Missing';
       secChip.className = 'status-pill light bad';
+      failClosedBadge.textContent = 'Failed (missing secret)';
+      failClosedBadge.className = 'status-pill light bad';
       showBanner('RAKSHA_SECRET is not set in the server environment. Pipeline execution fails closed.', 'bad');
     }
 
     const p = st.pipeline;
     const e = st.evaluation;
+    const execState = st.execution_state || 'idle';
     const pipeLabel = p.status === 'idle' ? 'Ready'
       : p.status === 'running' ? 'Processing'
       : p.status === 'succeeded' ? 'Succeeded (exit 0)'
@@ -1375,16 +1619,43 @@ async function refreshStatus() {
       : 'Failed — inspect local terminal';
     evalPill.textContent = evalLabel;
     evalPill.className = 'status-pill light ' + (e.status === 'completed' ? 'ok' : e.status === 'failed' ? 'bad' : e.status === 'running' ? 'lime' : '');
-    document.getElementById('eval-state-text').textContent = e.status === 'failed' ? 'Failed — inspect local terminal' : e.message;
+    document.getElementById('eval-state-text').textContent =
+      e.status === 'failed' ? (st.last_error || 'Failed — inspect local terminal')
+      : (st.eval_timestamp ? `${e.message} (${st.eval_timestamp})` : e.message);
 
-    document.getElementById('chk-pipe').textContent = 'Pipeline: ' + pipeLabel;
-    document.getElementById('chk-eval').textContent = 'Practice Eval: ' + evalLabel;
-    document.getElementById('chk-val').textContent = 'Contract: ' + e.contract_status;
+    document.getElementById('chk-pipe').textContent = '1. Pipeline: ' + pipeLabel;
+    document.getElementById('chk-eval').textContent = '2. Practice Eval (check_dev.py): ' + evalLabel;
+    document.getElementById('chk-val').textContent = '3. Output Contract (validate_output.py): ' + e.contract_status;
 
-    const busy = p.status === 'running' || e.status === 'running';
-    document.getElementById('btn-run').disabled = busy || !st.secret_configured;
-    document.getElementById('btn-eval').disabled = busy || !e.toolkit_available || st.sanitized_file_count === 0;
+    const busy = execState === 'pipeline_running' || execState === 'evaluation_running';
+    const btnRun = document.getElementById('btn-run');
+    const btnEval = document.getElementById('btn-eval');
+    btnRun.disabled = busy || !st.secret_configured;
+    btnEval.disabled = busy || !e.toolkit_available || st.sanitized_file_count === 0;
+    btnRun.textContent = execState === 'pipeline_running' ? 'Running Pipeline...' : 'Run Pipeline';
+    btnEval.textContent = execState === 'evaluation_running' ? 'Evaluating...' : 'Run Official Evaluation';
 
+    if (st.secret_configured) {
+      if (execState === 'pipeline_running') {
+        showBanner('Processing privacy pipeline locally...', 'info');
+      } else if (execState === 'evaluation_running') {
+        showBanner('Running official practice evaluator and contract validator...', 'info');
+      } else if (execState === 'failed') {
+        showBanner(st.last_error || 'Execution failed — inspect local terminal.', 'bad');
+      } else if (execState === 'completed') {
+        if (lastExecState === 'pipeline_running' || lastExecState === 'evaluation_running') {
+          showBanner('Completed — ' + (e.status === 'completed' ? e.message : p.message), 'ok');
+        } else {
+          const cur = document.getElementById('banner');
+          if (cur.classList.contains('info') && cur.textContent.includes('Processing')) {
+            showBanner('Completed — ' + (e.status === 'completed' ? e.message : p.message), 'ok');
+          }
+        }
+      }
+    }
+    lastExecState = execState;
+
+    document.getElementById('ov-scope').textContent = `${st.input_label || 'input'} -> ${st.output_label || 'output'}`;
     const r = st.report;
     if (r.available) {
       document.getElementById('k-total').textContent = r.files_total;
@@ -1396,8 +1667,10 @@ async function refreshStatus() {
         ? (r.records_processed - r.records_linked) : '-';
       document.getElementById('k-unlinked').textContent = 'Unresolved: ' + unres;
       document.getElementById('ov-records').textContent = r.records_processed;
-      document.getElementById('ov-runtime').textContent = r.timing_seconds + 's';
-      document.getElementById('schema-pill').textContent = 'schema: ' + r.schema;
+      const rssText = (typeof r.peak_rss_mb === 'number' && r.peak_rss_mb > 0) ? ` / ${r.peak_rss_mb} MB RSS` : '';
+      document.getElementById('ov-runtime').textContent = r.timing_seconds + 's' + rssText;
+      document.getElementById('ov-updated').textContent = r.last_updated || 'Not reported';
+      document.getElementById('schema-pill').textContent = 'schema: ' + r.schema + ' ->';
 
       document.getElementById('ms-1').textContent = r.files_sanitized + '/' + r.files_total + ' valid';
       document.getElementById('ms-2').textContent = r.identifiers_detected + ' entities';
@@ -1423,6 +1696,17 @@ async function refreshStatus() {
         const pct = Math.max(4, Math.round((v / maxVal) * 100));
         return `<div class="entity-row"><span class="entity-name">${esc(k)}</span><div class="mini-bar-track"><div class="mini-bar-fill" style="width:${pct}%"></div></div><span class="entity-count">${esc(v)}</span></div>`;
       }).join('') || '<div class="vital-sub">No entities recorded.</div>';
+
+      document.getElementById('pl-ent-count').textContent = `${entries.length} categories`;
+      document.getElementById('pl-all-entities').innerHTML = entries.map(([k, v]) =>
+        `<div class="detail-chip"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`
+      ).join('') || '<div class="vital-sub">No entities recorded.</div>';
+
+      const qList = r.quarantined_files || [];
+      document.getElementById('pl-quar-count').textContent = `${qList.length} quarantined`;
+      document.getElementById('pl-quarantine-list').innerHTML = qList.map(q =>
+        `<div class="detail-chip"><span>${esc(q.id)} (${esc(q.reason)})</span><strong>raw_copy_prevented: ${esc(q.raw_copy_prevented)}</strong></div>`
+      ).join('') || '<div class="vital-sub">No quarantined files recorded.</div>';
     }
 
     const m = e.metrics;
@@ -1453,6 +1737,27 @@ async function refreshStatus() {
     document.getElementById('ev-merges').textContent = m.false_merges;
     document.getElementById('ev-raw').textContent = m.raw_copies;
     document.getElementById('ev-contract').textContent = e.contract_status;
+
+    const quarBadge = document.getElementById('sec-quar-badge');
+    const quarMeta = document.getElementById('sec-quar-meta');
+    if (m.raw_copies === '0') {
+      quarBadge.textContent = 'Verified (0 raw copies)';
+      quarBadge.className = 'status-pill light ok';
+      quarMeta.textContent = 'Evidence: check_dev.py RAW COPIES: 0';
+    } else if (m.raw_copies !== 'Not reported') {
+      quarBadge.textContent = `Failed (${m.raw_copies} raw copies)`;
+      quarBadge.className = 'status-pill light bad';
+      quarMeta.textContent = 'Evidence: check_dev.py RAW COPIES';
+    }
+
+    const pb = st.probe_breakdown;
+    if (pb && Array.isArray(pb.categories)) {
+      document.getElementById('ev-probe-summary').textContent =
+        `${pb.retained} / ${pb.total} (${pb.pct}%) — ${pb.lost} generalized`;
+      document.getElementById('eval-probe-breakdown').innerHTML = pb.categories.map(c =>
+        `<div class="detail-chip"><span>${esc(c.kind)} (${esc(c.group)})</span><strong>${esc(c.retained)}/${esc(c.total)} (${esc(c.pct)}%)${c.lost ? ` • ${esc(c.lost)} generalized` : ''}</strong></div>`
+      ).join('');
+    }
 
     if (busy && !pollTimer) {
       pollTimer = setInterval(async () => { await refreshStatus(); await refreshFiles(); }, 900);
@@ -1550,6 +1855,12 @@ function getCsrfToken() {
 }
 
 async function triggerRun() {
+  if (lastSnapshot && lastSnapshot.sanitized_file_count > 0) {
+    const ok = window.confirm(
+      `Sanitized output already exists (${lastSnapshot.sanitized_file_count} files). Re-running will overwrite the current output directory. Continue?`
+    );
+    if (!ok) return;
+  }
   hideBanner();
   const res = await fetch('/api/run', {
     method: 'POST',

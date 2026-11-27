@@ -265,3 +265,78 @@ def test_dashboard_csrf_origin_host_and_no_inline_onclick(tmp_path: Path, monkey
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_execution_state_machine_and_probe_breakdown(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("RAKSHA_SECRET", "dashboard-state-test-secret-1234")
+    inp = tmp_path / "in"
+    inp.mkdir()
+    out = tmp_path / "out"
+    san = out / "sanitized"
+    san.mkdir(parents=True)
+    (san / "note.txt").write_text("Diagnosis: Type 2 Diabetes\nDistrict: [REGION]\n", encoding="utf-8")
+
+    # Report with quarantined entry (must never leak raw path or PII)
+    report_path = out / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema": "raksha-report/1",
+                "counts": {"files_total": 2, "files_sanitized": 1, "files_quarantined": 1},
+                "timing": {"seconds": 0.42},
+                "resources": {"peak_rss_mb": 48.5, "measurement_status": "measured"},
+                "entities": {"PERSON": 3, "DATE": 2},
+                "files": [
+                    {"input_sha256": "abcdef1234567890", "status": "quarantined", "reason": "unsupported_binary", "raw_name": "secret_patient_raj.bin"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    parsed = parse_report_json(report_path)
+    assert parsed["available"] is True
+    assert parsed["peak_rss_mb"] == 48.5
+    assert len(parsed["quarantined_files"]) == 1
+    q = parsed["quarantined_files"][0]
+    assert q["id"] == "abcdef123456"
+    assert q["raw_copy_prevented"] is True
+    assert "secret_patient_raj" not in json.dumps(parsed)
+
+    # Probe breakdown distinguishes 100% clinical retention from district generalization
+    truth_json = tmp_path / "truth.json"
+    truth_json.write_text(
+        json.dumps(
+            {
+                "preserve": [
+                    {"kind": "diagnosis", "text": "Type 2 Diabetes"},
+                    {"kind": "district", "text": "Ernakulam"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    pb = dashboard.compute_probe_breakdown(san, truth_json)
+    assert pb is not None
+    assert pb["total"] == 2
+    assert pb["retained"] == 1
+    assert pb["lost"] == 1
+    assert pb["pct"] == 50.0
+    cats = {c["kind"]: c for c in pb["categories"]}
+    assert cats["diagnosis"]["group"] == "clinical" and cats["diagnosis"]["retained"] == 1
+    assert cats["district"]["group"] == "demographic" and cats["district"]["lost"] == 1
+
+    # State machine starts idle
+    st_obj = dashboard.DashboardState(inp, out)
+    snap = st_obj.snapshot()
+    assert snap["execution_state"] == "idle"
+    assert snap["input_label"] == "in"
+    assert snap["output_label"] == "out"
+
+
+def test_dashboard_ux_accuracy_labels_and_single_desktop_nav():
+    assert "Preservation Probe Retention" in _DASHBOARD_HTML
+    assert "4. Full Submission Check (check_submission.py): CLI ONLY" in _DASHBOARD_HTML
+    assert "All Detected PII Entity Categories" in _DASHBOARD_HTML
+    assert "Quarantine Report (Safe Metadata Only)" in _DASHBOARD_HTML
+    assert "Localhost-Only Binding (Dashboard)" in _DASHBOARD_HTML
+    assert "@media (min-width: 769px) { .bottom-rail-wrap { display: none; } }" in _DASHBOARD_HTML
